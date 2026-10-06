@@ -1,0 +1,81 @@
+:root {
+  --bg: #ffffff;
+  --panel: #f6f7f9;
+  --text: #1a1a1a;
+  --muted: #8a8f98;
+  --border: #e2e5ea;
+  --accent: #4b7bec;
+}
+[data-theme="dark"] {
+  --bg: #17181c;
+  --panel: #1f2127;
+  --text: #e6e8ec;
+  --muted: #8a8f98;
+  --border: #2b2e36;
+  --accent: #6d9bff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 16px; margin: 0; }
+.actions { display: flex; gap: 8px; }
+input, button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+main {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 12px;
+  padding: 12px 16px;
+  height: calc(100vh - 57px);
+}
+.col { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px; overflow: auto; }
+.col h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+#users { list-style: none; margin: 0; padding: 0; }
+#users li {
+  padding: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  word-break: break-all;
+}
+#users li:hover { background: var(--bg); }
+#users li.active { border-color: var(--accent); }
+#users li .sub { color: var(--muted); font-size: 12px; }
+.muted { color: var(--muted); }
+.detail h3 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
+.detail ul { margin: 0; padding-left: 18px; }
+.detail pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+}
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.tag { color: var(--muted); font-size: 11px; margin-left: 6px; }
+.uid { font-weight: 600; margin-bottom: 4px; }

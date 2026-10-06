@@ -1,0 +1,156 @@
+{
+  "enable": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "idle_threshold_private": {
+    "description": "私聊空闲触发整理（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "idle_threshold_group": {
+    "description": "群聊空闲触发整理（秒）",
+    "type": "int",
+    "default": 900,
+    "hint": "群聊建议更久，避免群里临时安静就触发。"
+  },
+  "min_consolidate_interval": {
+    "description": "最小整理间隔（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "max_consolidate_per_hour": {
+    "description": "每用户每小时最大整理次数",
+    "type": "int",
+    "default": 6
+  },
+  "event_min_importance": {
+    "description": "事件落库的最低重要度",
+    "type": "int",
+    "default": 5
+  },
+  "inject_max_facts": {
+    "description": "注入事实条数上限",
+    "type": "int",
+    "default": 12
+  },
+  "inject_max_timeline": {
+    "description": "注入时间线条数上限",
+    "type": "int",
+    "default": 8
+  },
+  "decay_days": {
+    "description": "事实/记忆衰减天数",
+    "type": "int",
+    "default": 90,
+    "hint": "超过该天数且重要度低于 floor 的事实会被淘汰。"
+  },
+  "decay_importance_floor": {
+    "description": "衰减淘汰的重要度下限",
+    "type": "int",
+    "default": 50
+  },
+  "timeline_min_importance": {
+    "description": "注入时间线的最低重要度",
+    "type": "int",
+    "default": 10
+  },
+  "inject_text_max_chars": {
+    "description": "注入文本最大字符数",
+    "type": "int",
+    "default": 1200
+  },
+  "score_w_importance": {
+    "description": "读时打分：重要度权重",
+    "type": "float",
+    "default": 1.0
+  },
+  "score_w_freshness": {
+    "description": "读时打分：新鲜度权重",
+    "type": "float",
+    "default": 0.8
+  },
+  "score_w_tag": {
+    "description": "读时打分：标签命中权重",
+    "type": "float",
+    "default": 0.6
+  },
+  "score_w_pinned": {
+    "description": "读时打分：置顶权重",
+    "type": "float",
+    "default": 0.5
+  },
+  "cold_enable": {
+    "description": "启用冷层（超期记忆向量归档 + 按需回捞）",
+    "type": "bool",
+    "default": true,
+    "hint": "需要配置嵌入 provider 才能生效。"
+  },
+  "cold_migrate_days": {
+    "description": "超期迁入冷层的天数阈值",
+    "type": "int",
+    "default": 30
+  },
+  "cold_retrieve_top_k": {
+    "description": "冷层检索返回条数",
+    "type": "int",
+    "default": 5
+  },
+  "cold_use_rerank": {
+    "description": "冷层检索使用重排",
+    "type": "bool",
+    "default": true,
+    "hint": "需要 AstrBot 已配置重排模型。"
+  },
+  "cold_retrieve_cues": {
+    "description": "触发冷层检索的正则线索",
+    "type": "text",
+    "default": "还记得|上次|之前|以前|那天|当时|曾经|回忆|你忘了|记不记得"
+  },
+  "chunk_chars": {
+    "description": "冷层分块的目标字符数",
+    "type": "int",
+    "default": 400
+  },
+  "embedding_provider_id": {
+    "description": "冷层嵌入模型（provider ID）",
+    "type": "string",
+    "default": "",
+    "hint": "AstrBot 目前不提供嵌入模型选择器，只能填 ID；留空=自动用第一个可用嵌入模型（通常就够）。用 /usermem 模型 查看 ID。"
+  },
+  "rerank_provider_id": {
+    "description": "冷层重排模型（provider ID）",
+    "type": "string",
+    "default": "",
+    "hint": "AstrBot 目前不提供重排模型选择器，只能填 ID；留空=自动用第一个可用重排模型。用 /usermem 模型 查看 ID。"
+  },
+  "consolidate_provider_id": {
+    "description": "整理使用的 LLM 模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "下拉选择 AstrBot 已配置的聊天模型；留空=当前会话模型。"
+  },
+  "consolidate_max_events": {
+    "description": "单次整理最多处理的事件条数",
+    "type": "int",
+    "default": 40
+  },
+  "remember_cues": {
+    "description": "即时记忆触发词（正则）",
+    "type": "text",
+    "default": "记住|记一下|记下|别忘|帮我记住",
+    "hint": "用户消息命中时，立即把后面的内容写成 pinned 事实并注入（无需等空闲整理）。"
+  },
+  "remember_importance": {
+    "description": "即时记忆的重要度",
+    "type": "int",
+    "default": 95
+  },
+  "debug": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false
+  }
+}

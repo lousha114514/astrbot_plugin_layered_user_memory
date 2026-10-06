@@ -1,0 +1,1 @@
+# 本插件无第三方依赖，全部使用 Python 标准库与 AstrBot 内置 API。

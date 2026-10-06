@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境与密钥
+.env
+.env.*
+*.local
+
+# AstrBot 运行时数据
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# 打包产物
+*.zip
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统与日志
+.DS_Store
+Thumbs.db
+*.log
