@@ -87,7 +87,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DEFAULTS = {
     "enable": True,
@@ -428,6 +428,72 @@ class _Store:
             "chunks": ch,
         }
 
+    def update_fact(self, user_id, old_value, patch):
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT facts FROM users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            facts = []
+            if row and row["facts"]:
+                try:
+                    facts = json.loads(row["facts"])
+                except Exception:
+                    facts = []
+            changed = 0
+            for f in facts:
+                if str(f.get("value")) == str(old_value):
+                    for k in ("key", "value", "importance", "tags", "pinned"):
+                        if k in patch and patch[k] is not None:
+                            f[k] = patch[k]
+                    f["updated_ts"] = int(time.time())
+                    changed += 1
+            if changed:
+                self.conn.execute(
+                    "UPDATE users SET facts=? WHERE user_id=?",
+                    (json.dumps(facts, ensure_ascii=False), user_id),
+                )
+                self.conn.commit()
+            return changed
+
+    def delete_fact(self, user_id, value):
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT facts FROM users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            facts = []
+            if row and row["facts"]:
+                try:
+                    facts = json.loads(row["facts"])
+                except Exception:
+                    facts = []
+            new = [f for f in facts if str(f.get("value")) != str(value)]
+            removed = len(facts) - len(new)
+            if removed:
+                self.conn.execute(
+                    "UPDATE users SET facts=? WHERE user_id=?",
+                    (json.dumps(new, ensure_ascii=False), user_id),
+                )
+                self.conn.commit()
+            return removed
+
+    def set_inject_text(self, user_id, text):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO inject_cache(user_id,text,updated_ts,version) VALUES(?,?,?,1)"
+                " ON CONFLICT(user_id) DO UPDATE SET text=excluded.text,"
+                " updated_ts=excluded.updated_ts, version=version+1",
+                (user_id, text, int(time.time())),
+            )
+            self.conn.commit()
+
+    def delete_event(self, user_id, eid):
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM events WHERE user_id=? AND id=?", (user_id, int(eid))
+            )
+            self.conn.commit()
+            return cur.rowcount
+
     def stats(self, user_id):
         with self._lock:
             ev = self.conn.execute(
@@ -467,6 +533,21 @@ class UserMemoryPlugin(Star):
                 )
                 self.context.register_web_api(
                     f"/{PLUGIN_NAME}/meta", self.api_meta, ["GET"], "Plugin meta"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/fact/add", self.api_fact_add, ["POST"], "Add fact"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/fact/update", self.api_fact_update, ["POST"], "Update fact"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/fact/delete", self.api_fact_delete, ["POST"], "Delete fact"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/inject/save", self.api_inject_save, ["POST"], "Save inject text"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/event/delete", self.api_event_delete, ["POST"], "Delete event"
                 )
         except Exception as e:
             logger.warning(f"[用户记忆] 注册 Web API 失败: {e}")
@@ -1085,6 +1166,100 @@ class UserMemoryPlugin(Star):
             return error_response("缺少 user_id")
         await asyncio.to_thread(store.forget_user, uid)
         return json_response({"ok": True})
+
+    @staticmethod
+    def _split_tags(v):
+        if isinstance(v, list):
+            return [str(t).strip() for t in v if str(t).strip()]
+        if v is None:
+            return []
+        return [t.strip() for t in str(v).replace("，", ",").split(",") if t.strip()]
+
+    async def api_fact_add(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        p = await request.json(default={}) or {}
+        uid = str(p.get("user_id") or "").strip()
+        val = str(p.get("value") or "").strip()
+        if not uid or not val:
+            return error_response("缺少 user_id 或 value")
+        await asyncio.to_thread(store.ensure_user, uid)
+        fact = self._normalize_facts(
+            [
+                {
+                    "key": p.get("key", ""),
+                    "value": val,
+                    "importance": _safe_int(p.get("importance", 60), 60),
+                    "tags": self._split_tags(p.get("tags")),
+                    "pinned": bool(p.get("pinned", False)),
+                    "updated_ts": int(time.time()),
+                }
+            ]
+        )
+        if not fact:
+            return error_response("事实不合法")
+        await asyncio.to_thread(store.add_fact, uid, fact[0])
+        return json_response({"ok": True})
+
+    async def api_fact_update(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        p = await request.json(default={}) or {}
+        uid = str(p.get("user_id") or "").strip()
+        old_value = str(p.get("old_value") or "").strip()
+        if not uid or not old_value:
+            return error_response("缺少 user_id 或 old_value")
+        patch = {}
+        for k in ("key", "value"):
+            if k in p:
+                patch[k] = str(p.get(k) or "")
+        if "importance" in p:
+            patch["importance"] = _clamp(_safe_int(p.get("importance"), 50), 0, 100)
+        if "tags" in p:
+            patch["tags"] = self._split_tags(p.get("tags"))
+        if "pinned" in p:
+            patch["pinned"] = bool(p.get("pinned"))
+        n = await asyncio.to_thread(store.update_fact, uid, old_value, patch)
+        return json_response({"ok": bool(n), "changed": n})
+
+    async def api_fact_delete(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        p = await request.json(default={}) or {}
+        uid = str(p.get("user_id") or "").strip()
+        val = str(p.get("value") or "").strip()
+        if not uid or not val:
+            return error_response("缺少 user_id 或 value")
+        n = await asyncio.to_thread(store.delete_fact, uid, val)
+        return json_response({"ok": bool(n), "removed": n})
+
+    async def api_inject_save(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        p = await request.json(default={}) or {}
+        uid = str(p.get("user_id") or "").strip()
+        if not uid:
+            return error_response("缺少 user_id")
+        text = str(p.get("text") or "")
+        await asyncio.to_thread(store.ensure_user, uid)
+        await asyncio.to_thread(store.set_inject_text, uid, text)
+        return json_response({"ok": True})
+
+    async def api_event_delete(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        p = await request.json(default={}) or {}
+        uid = str(p.get("user_id") or "").strip()
+        eid = p.get("id")
+        if not uid or eid is None:
+            return error_response("缺少 user_id 或 id")
+        n = await asyncio.to_thread(store.delete_event, uid, eid)
+        return json_response({"ok": bool(n)})
 
     async def terminate(self):
         for t in list(self._idle_tasks.values()):
