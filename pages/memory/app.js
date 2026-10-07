@@ -284,6 +284,24 @@ document.getElementById("refresh").onclick = () => {
   loadUsers();
   if (currentUid) loadDetail(currentUid);
 };
+
+// 主题切换（蓝白 <-> 深色）
+const themeBtn = document.getElementById("theme");
+function applyTheme(dark) {
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  if (themeBtn) themeBtn.textContent = dark ? "☀️" : "🌙";
+}
+let isDark = false;
+try {
+  isDark = !!(bridge.getContext() && bridge.getContext().isDark);
+} catch {}
+applyTheme(isDark);
+if (themeBtn) {
+  themeBtn.onclick = () => {
+    isDark = !isDark;
+    applyTheme(isDark);
+  };
+}
 searchEl.addEventListener("input", renderUsers);
 try {
   const meta = pick(await bridge.apiGet("meta"));

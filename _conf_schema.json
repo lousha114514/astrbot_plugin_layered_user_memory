@@ -152,5 +152,23 @@
     "description": "调试日志",
     "type": "bool",
     "default": false
+  },
+  "min_event_chars": {
+    "description": "事件最小字符数（过滤无意义短句）",
+    "type": "int",
+    "default": 5,
+    "hint": "小于该长度、或纯标点/表情的消息不记录。"
+  },
+  "strip_mentions": {
+    "description": "记录时去除 @提及 / CQ 码",
+    "type": "bool",
+    "default": true,
+    "hint": "避免把他人的昵称、QQ 号写进本人记忆。"
+  },
+  "admin_ids": {
+    "description": "插件管理员 QQ 号列表（可查看他人记忆）",
+    "type": "list",
+    "default": [],
+    "hint": "留空则仅 AstrBot 全局管理员可用；管理员命令：/usermem 列表、/usermem 查看 <user_id>。"
   }
 }

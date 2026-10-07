@@ -87,7 +87,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 DEFAULTS = {
     "enable": True,
@@ -98,6 +98,9 @@ DEFAULTS = {
     "max_consolidate_per_hour": 6,
     # 记录
     "event_min_importance": 5,
+    # 内容长度/有效性校验
+    "min_event_chars": 5,
+    "strip_mentions": True,
     # 读时选择（注入上限 + 衰减）
     "inject_max_facts": 12,
     "inject_max_timeline": 8,
@@ -126,6 +129,8 @@ DEFAULTS = {
     "remember_cues": "记住|记一下|记下|别忘|帮我记住",
     "remember_importance": 95,
     "debug": False,
+    # 插件级管理员（可查看他人记忆）；留空则仅 AstrBot 全局管理员可用
+    "admin_ids": [],
 }
 
 SCHEMA = """
@@ -494,6 +499,44 @@ class _Store:
             self.conn.commit()
             return cur.rowcount
 
+    def set_alias(self, user_id, name):
+        name = (name or "").strip()
+        if not name:
+            return
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT aliases FROM users WHERE user_id=?", (user_id,)
+            ).fetchone()
+            names = []
+            if row and row["aliases"]:
+                try:
+                    names = json.loads(row["aliases"])
+                except Exception:
+                    names = []
+            if not isinstance(names, list):
+                names = []
+            names = [n for n in names if n != name]
+            names.append(name)
+            names = names[-5:]
+            self.conn.execute(
+                "UPDATE users SET aliases=? WHERE user_id=?",
+                (json.dumps(names, ensure_ascii=False), user_id),
+            )
+            self.conn.commit()
+
+    def nickname(self, user_id):
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT aliases FROM users WHERE user_id=?", (user_id,)
+            ).fetchone()
+        if not row or not row["aliases"]:
+            return ""
+        try:
+            names = json.loads(row["aliases"])
+        except Exception:
+            return ""
+        return names[-1] if isinstance(names, list) and names else ""
+
     def stats(self, user_id):
         with self._lock:
             ev = self.conn.execute(
@@ -602,10 +645,14 @@ class UserMemoryPlugin(Star):
             store = self._get_store()
             if store is None:
                 return
-            text = (event.message_str or "").strip()
-            if not text:
-                return
             user_id = str(event.get_sender_id())
+            await asyncio.to_thread(store.ensure_user, user_id)
+            nick = self._sender_name(event)
+            if nick:
+                await asyncio.to_thread(store.set_alias, user_id, nick)
+            text = self._clean_text(event.message_str or "")
+            if not self._is_meaningful(text):
+                return
             scene = self._scene(event)
             importance = self._estimate_importance(text)
             if importance < _safe_int(self.cfg("event_min_importance"), 5):
@@ -664,6 +711,32 @@ class UserMemoryPlugin(Star):
             return bool(re.search(cues, text))
         except re.error:
             return False
+
+    _AT_RE = re.compile(r"@[^\s@()]{1,40}\(\s*\d{4,}\s*\)|\[CQ:[^\]]*\]|<@!?\d+>")
+
+    def _clean_text(self, text: str) -> str:
+        """去除 @提及/CQ码 等噪音（避免他人身份泄漏进本人记忆）。"""
+        t = text or ""
+        if self.cfg("strip_mentions"):
+            t = self._AT_RE.sub(" ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def _is_meaningful(self, text: str) -> bool:
+        """长度/内容校验：过滤过短、纯标点/表情/无意义片段。"""
+        t = (text or "").strip()
+        if len(t) < max(1, _safe_int(self.cfg("min_event_chars"), 5)):
+            return False
+        if not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", t):
+            return False
+        return True
+
+    @staticmethod
+    def _sender_name(event) -> str:
+        try:
+            return (event.get_sender_name() or "").strip()
+        except Exception:
+            return ""
 
     def _extract_remember_payload(self, text: str) -> str:
         cues = str(self.cfg("remember_cues") or "")
@@ -736,7 +809,11 @@ class UserMemoryPlugin(Star):
 
             facts = self._load_facts(user)
             narrative = (user.get("narrative") or "") if user else ""
-            result = await self._llm_consolidate(facts, narrative, events)
+            try:
+                nickname = await asyncio.to_thread(store.nickname, user_id)
+            except Exception:
+                nickname = ""
+            result = await self._llm_consolidate(facts, narrative, events, user_id, nickname)
             if not result:
                 return
             new_facts = self._normalize_facts(result.get("facts", facts))
@@ -745,6 +822,8 @@ class UserMemoryPlugin(Star):
             for pf in facts:
                 if pf.get("pinned") and str(pf.get("value")) not in have:
                     new_facts.append(pf)
+            # 身份锚定：本人 user_id / 昵称 始终在案
+            new_facts = self._ensure_identity_facts(new_facts, user_id, nickname)
             new_narrative = result.get("narrative", narrative)
             ctx_text = (result.get("inject_text", "") or "")[
                 : _safe_int(self.cfg("inject_text_max_chars"), 1200)
@@ -799,7 +878,38 @@ class UserMemoryPlugin(Star):
             )
         return out
 
-    async def _llm_consolidate(self, facts, narrative, events):
+    def _ensure_identity_facts(self, facts, user_id, nickname):
+        """确保本人 QQ号/昵称 始终作为事实存在（去除 LLM 可能写错的同类项）。"""
+        now = int(time.time())
+        out = [
+            f
+            for f in facts
+            if str(f.get("key") or "").strip() not in ("QQ号", "QQ", "user_id", "昵称")
+        ]
+        out.append(
+            {
+                "key": "QQ号",
+                "value": str(user_id),
+                "importance": 100,
+                "tags": [],
+                "pinned": True,
+                "updated_ts": now,
+            }
+        )
+        if nickname:
+            out.append(
+                {
+                    "key": "昵称",
+                    "value": nickname,
+                    "importance": 90,
+                    "tags": [],
+                    "pinned": True,
+                    "updated_ts": now,
+                }
+            )
+        return out
+
+    async def _llm_consolidate(self, facts, narrative, events, user_id="", nickname=""):
         provider_id = str(self.cfg("consolidate_provider_id") or "").strip()
         if not provider_id:
             try:
@@ -820,6 +930,13 @@ class UserMemoryPlugin(Star):
             "只输出 JSON，无多余文字：\n"
             '{"facts":[{"key":"","value":"","importance":0-100,"tags":[""],'
             '"pinned":false,"updated_ts":0}],"narrative":"","inject_text":""}\n'
+            "【本档案的主人（必须锚定，勿混淆）】\n"
+            f"- user_id（QQ号）：{user_id}\n"
+            f"- 当前昵称：{nickname or '（未知）'}\n"
+            "硬性规则：\n"
+            "1) 只记录“本人”的信息；事件文本中出现的其他昵称/QQ号均属于他人。\n"
+            "2) 严禁把他人的昵称、QQ、喜好、关系写成本人的 facts（最常见错误：把被 @ 的人当成本人）。\n"
+            "3) 本人身份一律以给定的 user_id / 昵称为准。\n\n"
             "要求：\n"
             "1. facts = 稳定事实（身份/偏好/关系/习惯）。去重、合并、冲突以新为准；\n"
             "   importance 表示长期重要度；tags 为检索关键词；updated_ts 为 Unix 秒（可留 0）。\n"
@@ -1081,7 +1198,8 @@ class UserMemoryPlugin(Star):
             yield event.plain_result("用户记忆：存储未就绪。")
             return
         user_id = str(event.get_sender_id())
-        arg = (event.message_str or "").split()[-1].strip().lower()
+        tokens = (event.message_str or "").split()
+        arg = tokens[0].strip().lower() if tokens else ""
 
         if arg in ("forget", "删除", "清除"):
             await asyncio.to_thread(store.forget_user, user_id)
@@ -1094,6 +1212,30 @@ class UserMemoryPlugin(Star):
         if arg in ("models", "模型"):
             yield event.plain_result(self._list_models())
             return
+        if arg in ("view", "查看"):
+            if not self._is_admin(event):
+                yield event.plain_result("权限不足：仅管理员可查看他人记忆。")
+                return
+            if len(tokens) < 2:
+                yield event.plain_result("用法：/usermem 查看 <user_id>")
+                return
+            target = tokens[1].strip()
+            detail = await asyncio.to_thread(store.get_detail, target)
+            events = await asyncio.to_thread(store.list_events, target, 10)
+            yield event.plain_result(self._format_detail(target, detail, events))
+            return
+        if arg in ("list", "列表"):
+            if not self._is_admin(event):
+                yield event.plain_result("权限不足：仅管理员可查看用户列表。")
+                return
+            users = await asyncio.to_thread(store.list_users, 50)
+            lines = ["【用户列表（最近活动）】"]
+            for u in users:
+                lines.append(
+                    f"- {u['user_id']}  事件{u.get('events', 0)} 冷层{u.get('chunks', 0)}"
+                )
+            yield event.plain_result("\n".join(lines))
+            return
 
         st = await asyncio.to_thread(store.stats, user_id)
         cached = await asyncio.to_thread(store.get_inject_text, user_id)
@@ -1102,7 +1244,7 @@ class UserMemoryPlugin(Star):
             f"- 事件数：{st['events']}\n"
             f"- 冷层块数：{st['chunks']}\n"
             f"- 语境文本：{'有' if cached else '无'}\n"
-            "指令：/usermem 整理、/usermem 删除、/usermem 模型"
+            "指令：/usermem 整理、/usermem 删除、/usermem 模型；管理员：/usermem 列表、/usermem 查看 <user_id>"
         )
 
     def _list_models(self) -> str:
@@ -1134,6 +1276,48 @@ class UserMemoryPlugin(Star):
     # ------------------------------------------------------------------ #
     # 7) WebUI 记忆可视化 API
     # ------------------------------------------------------------------ #
+    def _is_admin(self, event) -> bool:
+        ids = self.cfg("admin_ids") or []
+        if isinstance(ids, str):
+            ids = [x.strip() for x in ids.replace("，", ",").split(",") if x.strip()]
+        sid = str(event.get_sender_id())
+        try:
+            if sid in {str(x).strip() for x in ids}:
+                return True
+        except Exception:
+            pass
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _format_detail(uid, detail, events) -> str:
+        lines = [f"【用户 {uid} 的记忆】"]
+        facts = detail.get("facts") or []
+        if facts:
+            lines.append("事实：")
+            for f in facts:
+                kv = (
+                    f"{f.get('key')}：{f.get('value')}"
+                    if f.get("key")
+                    else str(f.get("value"))
+                )
+                lines.append(
+                    f"- {kv}  (imp={f.get('importance')}{' pinned' if f.get('pinned') else ''})"
+                )
+        if detail.get("inject_text"):
+            lines.append("语境：")
+            lines.append(str(detail["inject_text"]))
+        if events:
+            lines.append("最近事件：")
+            for e in events[:10]:
+                ts = time.strftime("%m-%d %H:%M", time.localtime(e["ts"]))
+                lines.append(f"- [{ts}] {e['content']}")
+        return "\n".join(lines)
+
     async def api_meta(self):
         return json_response({"plugin": PLUGIN_NAME, "version": __version__})
 
