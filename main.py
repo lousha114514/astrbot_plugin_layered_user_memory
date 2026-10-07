@@ -87,7 +87,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 DEFAULTS = {
     "enable": True,
@@ -1198,7 +1198,13 @@ class UserMemoryPlugin(Star):
             yield event.plain_result("用户记忆：存储未就绪。")
             return
         user_id = str(event.get_sender_id())
-        tokens = (event.message_str or "").split()
+        tokens = [
+            t
+            for t in re.sub(r"\s+", " ", (event.message_str or "").strip()).split(" ")
+            if t
+        ]
+        if tokens and tokens[0].lower() in ("usermem", "用户记忆"):
+            tokens = tokens[1:]
         arg = tokens[0].strip().lower() if tokens else ""
 
         if arg in ("forget", "删除", "清除"):
