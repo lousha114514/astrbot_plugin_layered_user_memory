@@ -87,7 +87,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 DEFAULTS = {
     "enable": True,
@@ -1219,13 +1219,13 @@ class UserMemoryPlugin(Star):
             yield event.plain_result(self._list_models())
             return
         if arg in ("view", "查看"):
-            if not self._is_admin(event):
+            target = tokens[1].strip() if len(tokens) >= 2 else user_id
+            if not target:
+                yield event.plain_result("用法：/usermem 查看 [user_id]")
+                return
+            if target != user_id and not self._is_admin(event):
                 yield event.plain_result("权限不足：仅管理员可查看他人记忆。")
                 return
-            if len(tokens) < 2:
-                yield event.plain_result("用法：/usermem 查看 <user_id>")
-                return
-            target = tokens[1].strip()
             detail = await asyncio.to_thread(store.get_detail, target)
             events = await asyncio.to_thread(store.list_events, target, 10)
             yield event.plain_result(self._format_detail(target, detail, events))
@@ -1250,7 +1250,7 @@ class UserMemoryPlugin(Star):
             f"- 事件数：{st['events']}\n"
             f"- 冷层块数：{st['chunks']}\n"
             f"- 语境文本：{'有' if cached else '无'}\n"
-            "指令：/usermem 整理、/usermem 删除、/usermem 模型；管理员：/usermem 列表、/usermem 查看 <user_id>"
+            "指令：/usermem 查看（自己）、/usermem 整理、/usermem 删除、/usermem 模型；管理员：/usermem 列表、/usermem 查看 <user_id>"
         )
 
     def _list_models(self) -> str:
