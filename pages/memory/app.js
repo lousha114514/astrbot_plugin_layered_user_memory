@@ -48,29 +48,33 @@ async function api(path, body) {
 }
 
 async function loadUsers() {
+  const kw = searchEl.value.trim();
   usersEl.innerHTML = '<li class="muted">加载中…</li>';
   try {
-    const data = pick(await bridge.apiGet("users", { limit: 300 }));
+    const data = kw
+      ? pick(await bridge.apiGet("search", { q: kw, limit: 300 }))
+      : pick(await bridge.apiGet("users", { limit: 300 }));
     allUsers = (data && data.users) || [];
-    renderUsers();
+    renderUsers(kw);
   } catch (e) {
     usersEl.innerHTML = `<li class="muted">加载失败：${esc(e.message)}</li>`;
   }
 }
 
-function renderUsers() {
-  const kw = searchEl.value.trim();
+function renderUsers(kw) {
+  kw = (kw != null ? kw : searchEl.value).trim();
   const list = kw ? allUsers.filter((u) => String(u.user_id).includes(kw)) : allUsers;
   usersEl.innerHTML = "";
   if (!list.length) {
-    usersEl.innerHTML = '<li class="muted">暂无记忆</li>';
+    usersEl.innerHTML = '<li class="muted">无匹配</li>';
     return;
   }
   for (const u of list) {
     const li = document.createElement("li");
     li.dataset.uid = u.user_id;
     if (u.user_id === currentUid) li.classList.add("active");
-    li.innerHTML = `${esc(u.user_id)}<div class="sub">事件 ${u.events ?? 0} · 冷层 ${u.chunks ?? 0} · ${fmt(u.last_ts)}</div>`;
+    const tag = u.matched === "fact" ? " · 命中事实" : u.matched === "event" ? " · 命中事件" : "";
+    li.innerHTML = `${esc(u.user_id)}<div class="sub">事件 ${u.events ?? 0} · 冷层 ${u.chunks ?? 0}${tag} · ${fmt(u.last_ts)}</div>`;
     li.onclick = () => loadDetail(u.user_id);
     usersEl.appendChild(li);
   }
@@ -282,6 +286,7 @@ function renderDetail(uid, user, events) {
 
 document.getElementById("refresh").onclick = () => {
   loadUsers();
+  renderSettings();
   if (currentUid) loadDetail(currentUid);
 };
 
@@ -302,7 +307,39 @@ if (themeBtn) {
     applyTheme(isDark);
   };
 }
-searchEl.addEventListener("input", renderUsers);
+searchEl.addEventListener("input", () => {
+  clearTimeout(searchEl._t);
+  searchEl._t = setTimeout(loadUsers, 300);
+});
+
+async function renderSettings() {
+  const box = document.getElementById("settings");
+  if (!box) return;
+  try {
+    const data = pick(await bridge.apiGet("providers"));
+    const embs = (data && data.embeddings) || [];
+    const rrs = (data && data.reranks) || [];
+    const cur = (data && data.current) || {};
+    const opt = (o, sel) =>
+      `<option value="${esc(o.id)}" ${o.id === sel ? "selected" : ""}>${esc(o.label)}</option>`;
+    box.innerHTML = `
+      <h2>模型设置</h2>
+      <label>嵌入模型</label>
+      <select id="sel-emb"><option value="">（默认/自动）</option>${embs.map((o) => opt(o, cur.embedding_provider_id)).join("")}</select>
+      <label>重排模型</label>
+      <select id="sel-rr"><option value="">（默认/自动）</option>${rrs.map((o) => opt(o, cur.rerank_provider_id)).join("")}</select>
+      <button id="save-prov">保存模型设置</button>`;
+    box.querySelector("#save-prov").onclick = async () => {
+      await api("providers/save", {
+        embedding_provider_id: box.querySelector("#sel-emb").value,
+        rerank_provider_id: box.querySelector("#sel-rr").value,
+      });
+      toast("已保存模型设置");
+    };
+  } catch (e) {
+    box.innerHTML = '<h2>模型设置</h2><div class="muted">加载失败</div>';
+  }
+}
 try {
   const meta = pick(await bridge.apiGet("meta"));
   if (meta && meta.version) {
@@ -312,3 +349,4 @@ try {
   }
 } catch {}
 await loadUsers();
+renderSettings();

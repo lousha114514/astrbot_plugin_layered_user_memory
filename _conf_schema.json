@@ -170,5 +170,17 @@
     "type": "list",
     "default": [],
     "hint": "留空则仅 AstrBot 全局管理员可用；管理员命令：/usermem 列表、/usermem 查看 <user_id>。"
+  },
+  "superadmin_ids": {
+    "description": "超管 QQ 号列表",
+    "type": "list",
+    "default": [],
+    "hint": "超管拥有普通管理员全部权限，且可查看受保护用户、可用 /usermem 保护/取消保护/保护列表 管理受保护名单。"
+  },
+  "protected_ids": {
+    "description": "受保护用户 QQ 号列表（普通管理员不可查看）",
+    "type": "list",
+    "default": [],
+    "hint": "仅超管可查看这些用户的记忆；普通管理员查询会被拒绝，列表也不展示。"
   }
 }

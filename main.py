@@ -87,7 +87,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 DEFAULTS = {
     "enable": True,
@@ -131,6 +131,10 @@ DEFAULTS = {
     "debug": False,
     # 插件级管理员（可查看他人记忆）；留空则仅 AstrBot 全局管理员可用
     "admin_ids": [],
+    # 超管（拥有普通管理员全部权限 + 可查看受保护用户 + 管理受保护名单）
+    "superadmin_ids": [],
+    # 受保护用户：普通管理员不可查看
+    "protected_ids": [],
 }
 
 SCHEMA = """
@@ -179,6 +183,14 @@ CREATE TABLE IF NOT EXISTS mem_chunks(
 CREATE INDEX IF NOT EXISTS idx_chunks_user ON mem_chunks(user_id);
 
 CREATE TABLE IF NOT EXISTS kv_state(k TEXT PRIMARY KEY, v TEXT);
+
+CREATE TABLE IF NOT EXISTS blocklist(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_block_user ON blocklist(user_id);
 """
 
 FENCE_RE = re.compile(r"^```[a-zA-Z]*\n?|\n?```$")
@@ -537,6 +549,63 @@ class _Store:
             return ""
         return names[-1] if isinstance(names, list) and names else ""
 
+    def search_users(self, q, limit):
+        like = f"%{q}%"
+        out = {}
+        with self._lock:
+            for r in self.conn.execute(
+                "SELECT e.user_id AS user_id, COUNT(*) AS events, MAX(e.ts) AS last_ts"
+                " FROM events e WHERE e.content LIKE ? GROUP BY e.user_id"
+                " ORDER BY last_ts DESC LIMIT ?",
+                (like, limit),
+            ).fetchall():
+                out[r["user_id"]] = {
+                    "user_id": r["user_id"],
+                    "events": r["events"],
+                    "last_ts": r["last_ts"],
+                    "matched": "event",
+                }
+            for r in self.conn.execute(
+                "SELECT user_id FROM users WHERE facts LIKE ? OR narrative LIKE ? LIMIT ?",
+                (like, like, limit),
+            ).fetchall():
+                d = out.setdefault(
+                    r["user_id"],
+                    {"user_id": r["user_id"], "events": 0, "last_ts": 0, "matched": "fact"},
+                )
+                d["matched"] = "fact"
+            for uid, d in out.items():
+                ev = self.conn.execute(
+                    "SELECT COUNT(*) c, MAX(ts) t FROM events WHERE user_id=?", (uid,)
+                ).fetchone()
+                d["events"] = ev["c"]
+                if ev["t"]:
+                    d["last_ts"] = max(d["last_ts"] or 0, ev["t"])
+                ch = self.conn.execute(
+                    "SELECT COUNT(*) c FROM mem_chunks WHERE user_id=?", (uid,)
+                ).fetchone()
+                d["chunks"] = ch["c"]
+        return list(out.values())[:limit]
+
+    def add_block(self, user_id, text):
+        text = str(text or "").strip()
+        if not text:
+            return
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO blocklist(user_id,text,ts) VALUES(?,?,?)",
+                (user_id, text, int(time.time())),
+            )
+            self.conn.commit()
+
+    def list_blocks(self, user_id, limit=50):
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT text FROM blocklist WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+            return [r["text"] for r in rows]
+
     def stats(self, user_id):
         with self._lock:
             ev = self.conn.execute(
@@ -591,6 +660,15 @@ class UserMemoryPlugin(Star):
                 )
                 self.context.register_web_api(
                     f"/{PLUGIN_NAME}/event/delete", self.api_event_delete, ["POST"], "Delete event"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/search", self.api_search, ["GET"], "Search memory"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/providers", self.api_providers, ["GET"], "List providers"
+                )
+                self.context.register_web_api(
+                    f"/{PLUGIN_NAME}/providers/save", self.api_providers_save, ["POST"], "Save providers"
                 )
         except Exception as e:
             logger.warning(f"[用户记忆] 注册 Web API 失败: {e}")
@@ -813,7 +891,13 @@ class UserMemoryPlugin(Star):
                 nickname = await asyncio.to_thread(store.nickname, user_id)
             except Exception:
                 nickname = ""
-            result = await self._llm_consolidate(facts, narrative, events, user_id, nickname)
+            try:
+                blocks = await asyncio.to_thread(store.list_blocks, user_id)
+            except Exception:
+                blocks = []
+            result = await self._llm_consolidate(
+                facts, narrative, events, user_id, nickname, blocks
+            )
             if not result:
                 return
             new_facts = self._normalize_facts(result.get("facts", facts))
@@ -909,7 +993,9 @@ class UserMemoryPlugin(Star):
             )
         return out
 
-    async def _llm_consolidate(self, facts, narrative, events, user_id="", nickname=""):
+    async def _llm_consolidate(
+        self, facts, narrative, events, user_id="", nickname="", blocks=None
+    ):
         provider_id = str(self.cfg("consolidate_provider_id") or "").strip()
         if not provider_id:
             try:
@@ -925,6 +1011,14 @@ class UserMemoryPlugin(Star):
             lines.append(f"- [{ts}][{e['scene']}] {e['content']}")
         events_text = "\n".join(lines)
 
+        blocks_text = ""
+        if blocks:
+            blocks_text = (
+                "【禁止重新添加（用户已删除，勿再写入）】\n"
+                + "\n".join(f"- {b}" for b in blocks)
+                + "\n\n"
+            )
+
         prompt = (
             "你是记忆整理助手。基于【已有画像】与【新增事件】，更新该用户的记忆。\n"
             "只输出 JSON，无多余文字：\n"
@@ -936,7 +1030,7 @@ class UserMemoryPlugin(Star):
             "硬性规则：\n"
             "1) 只记录“本人”的信息；事件文本中出现的其他昵称/QQ号均属于他人。\n"
             "2) 严禁把他人的昵称、QQ、喜好、关系写成本人的 facts（最常见错误：把被 @ 的人当成本人）。\n"
-            "3) 本人身份一律以给定的 user_id / 昵称为准。\n\n"
+            "3) 本人身份一律以给定的 user_id / 昵称为准。\n\n" + blocks_text +
             "要求：\n"
             "1. facts = 稳定事实（身份/偏好/关系/习惯）。去重、合并、冲突以新为准；\n"
             "   importance 表示长期重要度；tags 为检索关键词；updated_ts 为 Unix 秒（可留 0）。\n"
@@ -1223,8 +1317,8 @@ class UserMemoryPlugin(Star):
             if not target:
                 yield event.plain_result("用法：/usermem 查看 [user_id]")
                 return
-            if target != user_id and not self._is_admin(event):
-                yield event.plain_result("权限不足：仅管理员可查看他人记忆。")
+            if not self._can_view(event, target):
+                yield event.plain_result("权限不足：无权查看该用户记忆。")
                 return
             detail = await asyncio.to_thread(store.get_detail, target)
             events = await asyncio.to_thread(store.list_events, target, 10)
@@ -1235,12 +1329,49 @@ class UserMemoryPlugin(Star):
                 yield event.plain_result("权限不足：仅管理员可查看用户列表。")
                 return
             users = await asyncio.to_thread(store.list_users, 50)
+            if not self._is_superadmin(event):
+                users = [u for u in users if not self._is_protected(u["user_id"])]
             lines = ["【用户列表（最近活动）】"]
             for u in users:
                 lines.append(
                     f"- {u['user_id']}  事件{u.get('events', 0)} 冷层{u.get('chunks', 0)}"
                 )
             yield event.plain_result("\n".join(lines))
+            return
+        if arg in ("protect", "保护"):
+            if not self._is_superadmin(event):
+                yield event.plain_result("权限不足：仅超管可管理受保护名单。")
+                return
+            if len(tokens) < 2:
+                yield event.plain_result("用法：/usermem 保护 <user_id>")
+                return
+            ids = self._id_set(self.cfg("protected_ids"))
+            ids.add(tokens[1].strip())
+            self._set_config_list("protected_ids", ids)
+            yield event.plain_result(
+                f"已将 {tokens[1].strip()} 加入受保护名单（普通管理员不可查看）。"
+            )
+            return
+        if arg in ("unprotect", "取消保护"):
+            if not self._is_superadmin(event):
+                yield event.plain_result("权限不足：仅超管可管理受保护名单。")
+                return
+            if len(tokens) < 2:
+                yield event.plain_result("用法：/usermem 取消保护 <user_id>")
+                return
+            ids = self._id_set(self.cfg("protected_ids"))
+            ids.discard(tokens[1].strip())
+            self._set_config_list("protected_ids", ids)
+            yield event.plain_result(f"已将 {tokens[1].strip()} 移出受保护名单。")
+            return
+        if arg in ("protected", "保护列表"):
+            if not self._is_superadmin(event):
+                yield event.plain_result("权限不足：仅超管可查看受保护名单。")
+                return
+            ids = sorted(self._id_set(self.cfg("protected_ids")))
+            yield event.plain_result(
+                "【受保护用户】\n" + ("\n".join(f"- {i}" for i in ids) if ids else "（空）")
+            )
             return
 
         st = await asyncio.to_thread(store.stats, user_id)
@@ -1282,21 +1413,64 @@ class UserMemoryPlugin(Star):
     # ------------------------------------------------------------------ #
     # 7) WebUI 记忆可视化 API
     # ------------------------------------------------------------------ #
-    def _is_admin(self, event) -> bool:
-        ids = self.cfg("admin_ids") or []
-        if isinstance(ids, str):
-            ids = [x.strip() for x in ids.replace("，", ",").split(",") if x.strip()]
-        sid = str(event.get_sender_id())
+    @staticmethod
+    def _id_set(v) -> set:
+        if isinstance(v, str):
+            return {x.strip() for x in v.replace("，", ",").split(",") if x.strip()}
+        if isinstance(v, (list, tuple, set)):
+            return {str(x).strip() for x in v if str(x).strip()}
+        return set()
+
+    @staticmethod
+    def _sid(event) -> str:
         try:
-            if sid in {str(x).strip() for x in ids}:
-                return True
+            return str(event.get_sender_id())
         except Exception:
-            pass
+            return ""
+
+    def _is_superadmin(self, event) -> bool:
+        return self._sid(event) in self._id_set(self.cfg("superadmin_ids"))
+
+    def _is_admin(self, event) -> bool:
+        sid = self._sid(event)
+        if sid in self._id_set(self.cfg("admin_ids")) or self._is_superadmin(event):
+            return True
         try:
             if event.is_admin():
                 return True
         except Exception:
             pass
+        return False
+
+    def _is_protected(self, user_id: str) -> bool:
+        return str(user_id) in self._id_set(self.cfg("protected_ids"))
+
+    def _can_view(self, event, target_id) -> bool:
+        if str(target_id) == self._sid(event):
+            return True
+        if self._is_superadmin(event):
+            return True
+        if not self._is_admin(event):
+            return False
+        return not self._is_protected(target_id)
+
+    def _set_config_list(self, key, values):
+        vals = sorted({str(v).strip() for v in values if str(v).strip()})
+        try:
+            self.config[key] = vals
+        except Exception:
+            pass
+        self._save_config()
+        return vals
+
+    def _save_config(self) -> bool:
+        try:
+            save = getattr(self.config, "save_config", None)
+            if callable(save):
+                save()
+                return True
+        except Exception as e:
+            logger.warning(f"[用户记忆] 保存配置失败: {e}")
         return False
 
     @staticmethod
@@ -1323,6 +1497,54 @@ class UserMemoryPlugin(Star):
                 ts = time.strftime("%m-%d %H:%M", time.localtime(e["ts"]))
                 lines.append(f"- [{ts}] {e['content']}")
         return "\n".join(lines)
+
+    async def api_search(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        q = (request.query.get("q") or "").strip()
+        limit = request.query.get("limit", 100, type=int) or 100
+        if not q:
+            users = await asyncio.to_thread(store.list_users, min(limit, 500))
+        else:
+            users = await asyncio.to_thread(store.search_users, q, min(limit, 500))
+        return json_response({"users": users})
+
+    async def api_providers(self):
+        embs, rrs = [], []
+        try:
+            for p in self.context.get_all_embedding_providers():
+                pc = getattr(p, "provider_config", {}) or {}
+                pid = str(pc.get("id", ""))
+                embs.append({"id": pid, "label": f"{pid} ({pc.get('type', '')})"})
+        except Exception:
+            pass
+        try:
+            for p in getattr(self.context.provider_manager, "rerank_provider_insts", []) or []:
+                pc = getattr(p, "provider_config", {}) or {}
+                pid = str(pc.get("id", ""))
+                rrs.append({"id": pid, "label": f"{pid} ({pc.get('type', '')})"})
+        except Exception:
+            pass
+        return json_response(
+            {
+                "embeddings": embs,
+                "reranks": rrs,
+                "current": {
+                    "embedding_provider_id": str(self.cfg("embedding_provider_id") or ""),
+                    "rerank_provider_id": str(self.cfg("rerank_provider_id") or ""),
+                },
+            }
+        )
+
+    async def api_providers_save(self):
+        p = await request.json(default={}) or {}
+        if "embedding_provider_id" in p:
+            self.config["embedding_provider_id"] = str(p.get("embedding_provider_id") or "")
+        if "rerank_provider_id" in p:
+            self.config["rerank_provider_id"] = str(p.get("rerank_provider_id") or "")
+        self._save_config()
+        return json_response({"ok": True})
 
     async def api_meta(self):
         return json_response({"plugin": PLUGIN_NAME, "version": __version__})
@@ -1450,6 +1672,144 @@ class UserMemoryPlugin(Star):
             return error_response("缺少 user_id 或 id")
         n = await asyncio.to_thread(store.delete_event, uid, eid)
         return json_response({"ok": bool(n)})
+
+    @filter.llm_tool(name="edit_memory")
+    async def edit_memory_tool(
+        self,
+        event: AstrMessageEvent,
+        instruction: str,
+        user_id: str = "",
+        dry_run: bool = True,
+    ):
+        """修改或删除某个用户的长期记忆（仅管理员可用）。instruction 用自然语言描述要改什么，例如“把昵称改成阿强”“删掉关于猫的那条”。dry_run=True 时只返回将要执行的改动供确认；确认后再调用并设 dry_run=false。"""
+        if not self._is_admin(event):
+            return "权限不足：只有管理员可以修改记忆。"
+        target = (user_id or "").strip() or self._sid(event)
+        if not self._can_view(event, target):
+            return "权限不足：无权修改该用户的记忆。"
+        store = self._get_store()
+        if store is None:
+            return "存储未就绪。"
+        detail = await asyncio.to_thread(store.get_detail, target)
+        facts = detail.get("facts") or []
+        inject_text = detail.get("inject_text") or ""
+        ops = await self._parse_memory_edit(instruction, facts, inject_text)
+        if not ops:
+            return "无法解析这条指令，请说得更明确（或直接指定要删/改的内容）。"
+        if dry_run:
+            return "【待确认的改动】\n" + self._render_ops(ops) + "\n确认后再让我执行。"
+        done = await self._apply_memory_ops(target, ops, facts, store)
+        return "已执行：\n" + done
+
+    async def _parse_memory_edit(self, instruction, facts, inject_text):
+        provider_id = str(self.cfg("consolidate_provider_id") or "").strip()
+        if not provider_id:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(umo="")
+            except Exception:
+                provider_id = ""
+        if not provider_id:
+            return []
+        flist = [
+            {
+                "id": i,
+                "key": f.get("key"),
+                "value": f.get("value"),
+                "importance": f.get("importance"),
+                "pinned": f.get("pinned"),
+            }
+            for i, f in enumerate(facts)
+        ]
+        prompt = (
+            "你是记忆编辑解析器。根据管理员的自然语言指令，输出要执行的操作。\n"
+            '只输出 JSON：{"ops":[...]}，op 类型：\n'
+            '- {"type":"delete_fact","fact_id":N}\n'
+            '- {"type":"update_fact","fact_id":N,"key"?:str,"value"?:str,"importance"?:int}\n'
+            '- {"type":"add_fact","key":str,"value":str,"importance"?:int}\n'
+            '- {"type":"set_inject_text","text":str}\n'
+            "fact_id 使用下面列表的 id；不确定就不要产生任何操作。\n\n"
+            f"【现有事实】\n{json.dumps(flist, ensure_ascii=False)}\n\n"
+            f"【现有语境】\n{inject_text}\n\n"
+            f"【管理员指令】\n{instruction}\n"
+        )
+        try:
+            resp = await asyncio.wait_for(
+                self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt),
+                timeout=45,
+            )
+            data = json.loads(_strip_fence(getattr(resp, "completion_text", "") or ""))
+            ops = data.get("ops") if isinstance(data, dict) else None
+            return ops if isinstance(ops, list) else []
+        except Exception as e:
+            logger.warning(f"[用户记忆] 解析记忆编辑失败: {e}")
+            return []
+
+    @staticmethod
+    def _render_ops(ops) -> str:
+        lines = []
+        for op in ops:
+            t = op.get("type")
+            if t == "delete_fact":
+                lines.append(f"- 删除事实（id={op.get('fact_id')}）")
+            elif t == "update_fact":
+                lines.append(
+                    f"- 修改事实 id={op.get('fact_id')} → {op.get('value') or op.get('key') or ''}"
+                )
+            elif t == "add_fact":
+                lines.append(f"- 新增事实：{op.get('value')}")
+            elif t == "set_inject_text":
+                lines.append("- 替换语境文本")
+            else:
+                lines.append(f"- {t}")
+        return "\n".join(lines) if lines else "（无操作）"
+
+    async def _apply_memory_ops(self, user_id, ops, facts, store):
+        lines = []
+        for op in ops:
+            t = op.get("type")
+            fid = op.get("fact_id")
+            if t == "delete_fact":
+                val = None
+                if isinstance(fid, int) and 0 <= fid < len(facts):
+                    val = facts[fid].get("value")
+                if val:
+                    await asyncio.to_thread(store.delete_fact, user_id, val)
+                    await asyncio.to_thread(store.add_block, user_id, val)
+                    lines.append(f"已删除事实：{val}")
+            elif t == "update_fact":
+                old = None
+                if isinstance(fid, int) and 0 <= fid < len(facts):
+                    old = facts[fid].get("value")
+                patch = {k: op[k] for k in ("key", "value", "importance") if k in op}
+                if old and patch:
+                    await asyncio.to_thread(store.update_fact, user_id, old, patch)
+                    lines.append(f"已修改事实：{old} → {patch.get('value', old)}")
+            elif t == "add_fact":
+                v = str(op.get("value") or "").strip()
+                if v:
+                    fact = self._normalize_facts(
+                        [
+                            {
+                                "key": op.get("key", ""),
+                                "value": v,
+                                "importance": _safe_int(op.get("importance", 70), 70),
+                                "tags": [],
+                                "pinned": bool(op.get("pinned", False)),
+                                "updated_ts": int(time.time()),
+                            }
+                        ]
+                    )
+                    if fact:
+                        await asyncio.to_thread(store.ensure_user, user_id)
+                        await asyncio.to_thread(store.add_fact, user_id, fact[0])
+                        lines.append(f"已新增事实：{v}")
+            elif t == "set_inject_text":
+                await asyncio.to_thread(store.ensure_user, user_id)
+                await asyncio.to_thread(
+                    store.set_inject_text, user_id, str(op.get("text") or "")
+                )
+                lines.append("已替换语境文本")
+        return "\n".join(lines) if lines else "（无可执行操作）"
 
     async def terminate(self):
         for t in list(self._idle_tasks.values()):

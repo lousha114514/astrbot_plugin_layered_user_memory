@@ -109,6 +109,19 @@ th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: 600; }
 .tag { color: var(--muted); font-size: 11px; margin-left: 6px; }
 .uid { font-weight: 600; margin-bottom: 4px; font-size: 15px; }
+.settings { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.settings h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+.settings label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+.settings select {
+  width: 100%;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.settings button { margin-top: 10px; width: 100%; }
 .fact { padding: 7px 0; border-bottom: 1px dashed var(--border); }
 .fact-text { word-break: break-word; }
 .row-btns { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
