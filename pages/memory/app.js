@@ -120,7 +120,7 @@ async function loadDetail() {
 }
 
 function factCard(uid, f, i) {
-  return `<div class="card fact" data-i="${i}">
+  return `<div class="card fact ${f.pinned ? "pinned" : ""}" data-i="${i}">
     <div class="k">${esc(f.key || "")}</div>
     <div class="v">${esc(f.value)}</div>
     <div class="bar" title="重要度 ${f.importance ?? 50}"><i style="width:${Math.max(0, Math.min(100, f.importance ?? 50))}%"></i></div>

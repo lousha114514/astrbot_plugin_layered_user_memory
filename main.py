@@ -94,7 +94,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -636,6 +636,14 @@ class _Store:
             facts = json.loads(user.get("facts") or "[]")
         except Exception:
             facts = []
+        if isinstance(facts, list):
+            # 置顶优先展示，其次按重要度降序
+            facts.sort(
+                key=lambda f: (
+                    0 if f.get("pinned") else 1,
+                    -_safe_int(f.get("importance", 0), 0),
+                )
+            )
         return {
             "user_id": user_id,
             "facts": facts,

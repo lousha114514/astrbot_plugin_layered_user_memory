@@ -2,7 +2,7 @@ name: astrbot_plugin_user_memory
 display_name: 用户分层记忆
 desc: 以用户为单位的分层记忆：消息只做追加，空闲时用 LLM 整理成用户画像与预编译注入文本，回复时直接注入、不检索；超期记忆迁入本地向量冷层，仅在命中线索时按需回捞。
 short_desc: 以用户为单位的分层记忆
-version: v1.6.0
+version: v1.6.1
 author: lousha114514
 repo: https://github.com/lousha114514/-
 support_platforms:
