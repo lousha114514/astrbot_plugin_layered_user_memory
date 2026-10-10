@@ -363,7 +363,8 @@ async function renderSettings() {
       <button id="save-prov">保存模型设置</button>
       <h2>备份与迁移</h2>
       <button id="exp">导出记忆(JSON)</button>
-      <label class="file-label">导入记忆(JSON)<input id="imp" type="file" accept=".json,application/json" /></label>`;
+      <label class="file-label">导入记忆(JSON)<input id="imp" type="file" accept=".json,application/json" /></label>
+      <button id="rebuild" class="danger">重建数据库</button>`;
     box.querySelector("#save-prov").onclick = async () => {
       await api("providers/save", {
         embedding_provider_id: box.querySelector("#sel-emb").value,
@@ -396,6 +397,28 @@ async function renderSettings() {
       }
       await api("import", { data });
       toast("已导入");
+      loadUsers();
+    };
+    box.querySelector("#rebuild").onclick = async () => {
+      const btn = box.querySelector("#rebuild");
+      if (btn.dataset.confirm !== "1") {
+        btn.dataset.confirm = "1";
+        btn.textContent = "确认重建？(会先自动导出)";
+        return;
+      }
+      try {
+        const data = pick(await bridge.apiGet("export"));
+        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "user_memory_before_rebuild.json";
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (e) {}
+      await api("rebuild", {});
+      toast("数据库已重建");
+      currentUid = null;
+      detailEl.innerHTML = '<div class="muted">已重建</div>';
       loadUsers();
     };
   } catch (e) {

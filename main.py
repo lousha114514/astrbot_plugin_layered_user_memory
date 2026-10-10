@@ -89,7 +89,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -755,6 +755,39 @@ def _open_store(db_path: str) -> "_Store":
         return st
 
 
+def _quarantine_db(db_path: str, tag: str = "corrupt") -> str:
+    """把损坏/待重建的库及其 -wal/-shm 改名存档，返回存档后缀时间戳。"""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    with _STORE_REGISTRY_LOCK:
+        old = _STORE_REGISTRY.pop(db_path, None)
+    if old is not None:
+        try:
+            old.conn.close()
+        except Exception:
+            pass
+    for suffix in ("", "-wal", "-shm"):
+        src = db_path + suffix
+        if os.path.exists(src):
+            try:
+                os.replace(src, f"{src}.{tag}.{ts}")
+            except Exception:
+                pass
+    return ts
+
+
+def _open_store_safe(db_path: str) -> "_Store":
+    """打开库；若因损坏在构造阶段就失败，则改名存档并重建空库。"""
+    try:
+        return _open_store(db_path)
+    except sqlite3.DatabaseError as e:
+        msg = str(e).lower()
+        if "malformed" in msg or "corrupt" in msg or "not a database" in msg:
+            ts = _quarantine_db(db_path, "corrupt")
+            logger.error(f"[用户记忆] 数据库损坏，已改名存档 .corrupt.{ts} 并重建。")
+            return _open_store(db_path)
+        raise
+
+
 class UserMemoryPlugin(Star):
     """以用户为单位的分层记忆插件。"""
 
@@ -818,6 +851,9 @@ class UserMemoryPlugin(Star):
                 self._reg(
                     f"/{PLUGIN_NAME}/import", self.api_import, ["POST"], "Import memory"
                 )
+                self._reg(
+                    f"/{PLUGIN_NAME}/rebuild", self.api_rebuild, ["POST"], "Rebuild database"
+                )
         except Exception as e:
             logger.warning(f"[用户记忆] 注册 Web API 失败: {e}")
 
@@ -842,17 +878,23 @@ class UserMemoryPlugin(Star):
             )
             self._db_dir = os.path.join(base, PLUGIN_NAME)
             self._db_path = os.path.join(self._db_dir, "memory.db")
-            self._store = _open_store(self._db_path)
+            self._store = _open_store_safe(self._db_path)
             if not self._store.integrity_ok():
                 logger.error("[用户记忆] 完整性检查失败，尝试自愈重建。")
                 self._heal_db_sync()
             else:
                 self._maybe_backup()
+            self._store_error = ""
             logger.info(f"[用户记忆] 存储已就绪: {self._db_path}")
         except Exception as e:
+            self._store_error = str(e)
+            self._store = None
             logger.error(f"[用户记忆] 初始化存储失败: {e}", exc_info=True)
             return None
         return self._store
+
+    def _storage_error(self) -> str:
+        return f"存储不可用：{getattr(self, '_store_error', '') or '未初始化'}"
 
     async def _db(self, fn, *args):
         """在专用单线程中串行执行数据库操作；捕获损坏则自愈。"""
@@ -892,6 +934,14 @@ class UserMemoryPlugin(Star):
             logger.error(f"[用户记忆] 已自愈重建数据库（旧库改名 .corrupt.{ts}）")
         except Exception as e:
             logger.error(f"[用户记忆] 自愈失败: {e}")
+
+    def _rebuild_db_sync(self):
+        path = self._db_path
+        if not path:
+            return
+        ts = _quarantine_db(path, "bak")
+        self._store = _open_store(path)
+        logger.warning(f"[用户记忆] 已重建数据库（旧库改名 .bak.{ts}）")
 
     def _maybe_backup(self):
         if not self.cfg("backup_on_start") or not self._db_dir or self._store is None:
@@ -1599,6 +1649,21 @@ class UserMemoryPlugin(Star):
             except Exception as e:
                 yield event.plain_result(f"清除失败（可能数据库损坏）：{e}")
             return
+        if arg in ("rebuild", "重建", "重建库"):
+            if not self._is_superadmin(event):
+                yield event.plain_result("权限不足：仅超管可重建数据库。")
+                return
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    _DB_EXECUTOR, self._rebuild_db_sync
+                )
+                self._store = None
+                self._store_error = ""
+                self._get_store()
+                yield event.plain_result("数据库已重建（旧库已改名为 .bak.<时间戳>）。")
+            except Exception as e:
+                yield event.plain_result(f"重建失败：{e}")
+            return
         if arg in ("protect", "保护"):
             if not self._is_superadmin(event):
                 yield event.plain_result("权限不足：仅超管可管理受保护名单。")
@@ -1762,7 +1827,7 @@ class UserMemoryPlugin(Star):
     async def api_search(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         q = (request.query.get("q") or "").strip()
         limit = request.query.get("limit", 100, type=int) or 100
         if not q:
@@ -1810,14 +1875,14 @@ class UserMemoryPlugin(Star):
     async def api_export(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         data = await self._db(store.export_all)
         return json_response(data)
 
     async def api_import(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         p = await request.json(default={}) or {}
         data = p.get("data")
         if not isinstance(data, dict):
@@ -1825,13 +1890,25 @@ class UserMemoryPlugin(Star):
         n = await self._db(store.import_all, data)
         return json_response({"ok": True, "imported": n})
 
+    async def api_rebuild(self):
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                _DB_EXECUTOR, self._rebuild_db_sync
+            )
+            self._store = None
+            self._store_error = ""
+            self._get_store()
+            return json_response({"ok": True})
+        except Exception as e:
+            return error_response(f"重建失败：{e}", 500)
+
     async def api_meta(self):
         return json_response({"plugin": PLUGIN_NAME, "version": __version__})
 
     async def api_users(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         limit = request.query.get("limit", 200, type=int) or 200
         users = await self._db(store.list_users, max(1, min(limit, 500)))
         return json_response({"users": users})
@@ -1839,7 +1916,7 @@ class UserMemoryPlugin(Star):
     async def api_user(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         uid = request.query.get("user_id")
         if not uid:
             return error_response("缺少 user_id")
@@ -1850,7 +1927,7 @@ class UserMemoryPlugin(Star):
     async def api_forget(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         payload = await request.json(default={})
         uid = str((payload or {}).get("user_id") or "").strip()
         if not uid:
@@ -1869,7 +1946,7 @@ class UserMemoryPlugin(Star):
     async def api_fact_add(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         p = await request.json(default={}) or {}
         uid = str(p.get("user_id") or "").strip()
         val = str(p.get("value") or "").strip()
@@ -1896,7 +1973,7 @@ class UserMemoryPlugin(Star):
     async def api_fact_update(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         p = await request.json(default={}) or {}
         uid = str(p.get("user_id") or "").strip()
         old_value = str(p.get("old_value") or "").strip()
@@ -1918,7 +1995,7 @@ class UserMemoryPlugin(Star):
     async def api_fact_delete(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         p = await request.json(default={}) or {}
         uid = str(p.get("user_id") or "").strip()
         val = str(p.get("value") or "").strip()
@@ -1930,7 +2007,7 @@ class UserMemoryPlugin(Star):
     async def api_inject_save(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         p = await request.json(default={}) or {}
         uid = str(p.get("user_id") or "").strip()
         if not uid:
@@ -1943,7 +2020,7 @@ class UserMemoryPlugin(Star):
     async def api_event_delete(self):
         store = self._get_store()
         if store is None:
-            return error_response("存储未就绪")
+            return error_response(self._storage_error())
         p = await request.json(default={}) or {}
         uid = str(p.get("user_id") or "").strip()
         eid = p.get("id")
