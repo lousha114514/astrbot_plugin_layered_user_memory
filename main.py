@@ -94,7 +94,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -327,11 +327,25 @@ class _Store:
             except Exception:
                 return False
 
-    def export_all(self):
+    def export_all(self, user_id=None):
         with self._lock:
-            def rows(sql):
-                return [dict(r) for r in self.conn.execute(sql).fetchall()]
+            def rows(sql, params=()):
+                return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
+            if user_id:
+                uid = str(user_id)
+                return {
+                    "exported_at": int(time.time()),
+                    "version": __version__,
+                    "user_id": uid,
+                    "users": rows("SELECT * FROM users WHERE user_id=?", (uid,)),
+                    "events": rows("SELECT * FROM events WHERE user_id=?", (uid,)),
+                    "inject_cache": rows("SELECT * FROM inject_cache WHERE user_id=?", (uid,)),
+                    "mem_chunks": rows("SELECT * FROM mem_chunks WHERE user_id=?", (uid,)),
+                    "blocklist": rows(
+                        "SELECT user_id,text,ts FROM blocklist WHERE user_id=?", (uid,)
+                    ),
+                }
             return {
                 "exported_at": int(time.time()),
                 "version": __version__,
@@ -341,6 +355,19 @@ class _Store:
                 "mem_chunks": rows("SELECT * FROM mem_chunks"),
                 "blocklist": rows("SELECT user_id,text,ts FROM blocklist"),
             }
+
+    def events_by_ids(self, user_id, ids):
+        clean = [int(i) for i in (ids or []) if str(i).strip().isdigit()][:50]
+        if not clean:
+            return []
+        q = ",".join("?" for _ in clean)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT id,ts,scene,content,importance FROM events"
+                f" WHERE user_id=? AND id IN ({q}) ORDER BY id DESC",
+                [user_id, *clean],
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def import_all(self, data) -> int:
         n = 0
@@ -471,7 +498,7 @@ class _Store:
         q = ",".join("?" for _ in scenes)
         with self._lock:
             rows = self.conn.execute(
-                f"SELECT ts,scene,content,speaker_name,is_bot,user_id FROM events"
+                f"SELECT id,ts,scene,content,speaker_name,is_bot,user_id FROM events"
                 f" WHERE ts>=? AND scene IN ({q}) ORDER BY ts ASC LIMIT ?",
                 [ts_from, *list(scenes), limit],
             ).fetchall()
@@ -929,6 +956,9 @@ class UserMemoryPlugin(Star):
                     f"/{PLUGIN_NAME}/export", self.api_export, ["GET"], "Export memory"
                 )
                 self._reg(
+                    f"/{PLUGIN_NAME}/event/sources", self.api_event_sources, ["GET"], "Event sources"
+                )
+                self._reg(
                     f"/{PLUGIN_NAME}/import", self.api_import, ["POST"], "Import memory"
                 )
                 self._reg(
@@ -1349,6 +1379,15 @@ class UserMemoryPlugin(Star):
                     new_facts.append(pf)
             # 身份锚定：本人 user_id / 昵称 始终在案
             new_facts = self._ensure_identity_facts(new_facts, user_id, nickname)
+            # 幻觉复核：根据来源事件校验每一事实是否有依据
+            valid_ids = {e["id"] for e in events}
+            for f in new_facts:
+                if str(f.get("key") or "") in ("QQ号", "昵称"):
+                    f["verified"] = True
+                    continue
+                srcs = [s for s in (f.get("sources") or []) if s in valid_ids]
+                f["sources"] = srcs
+                f["verified"] = bool(srcs)
             new_narrative = result.get("narrative", narrative)
             ctx_text = (result.get("inject_text", "") or "")[
                 : _safe_int(self.cfg("inject_text_max_chars"), 1200)
@@ -1391,6 +1430,10 @@ class UserMemoryPlugin(Star):
             tags = f.get("tags") or []
             if not isinstance(tags, list):
                 tags = [str(tags)]
+            srcs = f.get("sources") or []
+            if not isinstance(srcs, list):
+                srcs = []
+            srcs = [x for x in (_safe_int(s, -1) for s in srcs) if x > 0]
             out.append(
                 {
                     "key": key,
@@ -1398,6 +1441,8 @@ class UserMemoryPlugin(Star):
                     "importance": _clamp(_safe_int(f.get("importance", 50), 50), 0, 100),
                     "tags": [str(t) for t in tags if str(t).strip()],
                     "pinned": bool(f.get("pinned", False)),
+                    "sources": srcs,
+                    "verified": bool(f.get("verified", True)),
                     "updated_ts": _safe_int(f.get("updated_ts", now), now) or now,
                 }
             )
@@ -1418,6 +1463,8 @@ class UserMemoryPlugin(Star):
                 "importance": 100,
                 "tags": [],
                 "pinned": True,
+                "sources": [],
+                "verified": True,
                 "updated_ts": now,
             }
         )
@@ -1429,6 +1476,8 @@ class UserMemoryPlugin(Star):
                     "importance": 90,
                     "tags": [],
                     "pinned": True,
+                    "sources": [],
+                    "verified": True,
                     "updated_ts": now,
                 }
             )
@@ -1454,13 +1503,14 @@ class UserMemoryPlugin(Star):
 
         def fmt(e):
             ts = time.strftime("%m-%d %H:%M", time.localtime(e["ts"]))
+            eid = e.get("id", "")
             if e.get("is_bot"):
                 who = e.get("speaker_name") or bot_name or e.get("user_id", "")
                 tag = "机器人"
             else:
                 who = e.get("speaker_name") or e.get("user_id", "")
                 tag = f"用户{e.get('user_id','')}"
-            return f"- [{ts}][{e.get('scene','')}] {who}({tag})：{e.get('content','')}"
+            return f"- [#{eid}][{ts}][{e.get('scene','')}] {who}({tag})：{e.get('content','')}"
 
         events_text = "\n".join(fmt(e) for e in events) or "（无）"
         ctx_text = "\n".join(fmt(e) for e in ctx_events) or "（无）"
@@ -1476,7 +1526,7 @@ class UserMemoryPlugin(Star):
             "你是用户记忆整理助手。只依据【角色】、【本人发言】与【对话上下文】更新【本人】的记忆。\n"
             "只输出 JSON，无多余文字：\n"
             '{"facts":[{"key":"","value":"","importance":0-100,"tags":[""],'
-            '"pinned":false,"updated_ts":0}],"narrative":"","inject_text":""}\n\n'
+            '"pinned":false,"sources":[1,2],"updated_ts":0}],"narrative":"","inject_text":""}\n\n'
             "【角色（只能使用这些身份，不得编造）】\n"
             f"- 本人：昵称={nickname or '（未知）'}，QQ={uid}\n"
             f"- 本机器人：昵称={bot_name or '（未知）'}，QQ={bot_id or '（未知）'}（只有一个机器人，不存在“二号/三号”）\n"
@@ -1487,7 +1537,8 @@ class UserMemoryPlugin(Star):
             "3) 只依据给定文本；不确定就不要写（宁缺毋滥）。\n"
             "4) 本人身份一律以给定的 QQ/昵称为准。\n"
             "5) 关系类描述必须带明确对象 QQ（如“常与 1145140011 互动”）；没有明确对象就不写关系。\n"
-            "6) 不要把同一个人拆成多个；机器人只有一个。\n\n" + blocks_text +
+            "6) 不要把同一个人拆成多个；机器人只有一个。\n"
+            "7) 每条 fact 必须给出 sources（引用的【本人发言】的 #编号）；找不到依据就不要写这条。\n\n" + blocks_text +
             "【本人发言（待整理）】\n" + events_text + "\n\n"
             "【对话上下文（仅供理解语境，不要为其中人物建立记忆）】\n" + ctx_text + "\n\n"
             "【已有 facts】\n" + json.dumps(facts, ensure_ascii=False) + "\n\n"
@@ -1544,7 +1595,13 @@ class UserMemoryPlugin(Star):
         max_tl = _safe_int(self.cfg("inject_max_timeline"), 8)
         budget = _safe_int(self.cfg("inject_text_max_chars"), 1200)
 
-        facts = [f for f in self._load_facts(user) if not self._drop_fact(f, now)]
+        inject_unverified = bool(self.cfg("inject_unverified"))
+        facts = [
+            f
+            for f in self._load_facts(user)
+            if not self._drop_fact(f, now)
+            and (f.get("verified", True) or inject_unverified)
+        ]
         facts.sort(key=lambda f: self._score_fact(f, msg, now), reverse=True)
         facts = facts[:max_facts]
 
@@ -2044,8 +2101,21 @@ class UserMemoryPlugin(Star):
         store = self._get_store()
         if store is None:
             return error_response(self._storage_error())
-        data = await self._db(store.export_all)
+        uid = (request.query.get("user_id") or "").strip()
+        data = await self._db(store.export_all, uid or None)
         return json_response(data)
+
+    async def api_event_sources(self):
+        store = self._get_store()
+        if store is None:
+            return error_response(self._storage_error())
+        uid = (request.query.get("user_id") or "").strip()
+        ids_raw = request.query.get("ids") or ""
+        if not uid:
+            return error_response("缺少 user_id")
+        ids = [i for i in re.split(r"[,\s]+", ids_raw) if i.strip().isdigit()]
+        rows = await self._db(store.events_by_ids, uid, ids)
+        return json_response({"events": rows})
 
     async def api_import(self):
         store = self._get_store()

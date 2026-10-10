@@ -81,6 +81,12 @@
     "type": "float",
     "default": 0.5
   },
+  "inject_unverified": {
+    "description": "注入未验证的事实",
+    "type": "bool",
+    "default": false,
+    "hint": "整理时未给出有效来源（sources）的事实默认不注入；开启后连未验证的也注入。"
+  },
   "cold_enable": {
     "description": "启用冷层（超期记忆向量归档 + 按需回捞）",
     "type": "bool",

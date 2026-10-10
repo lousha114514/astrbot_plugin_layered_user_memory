@@ -46,6 +46,15 @@ function confirmModal(title, text, onYes) {
   $("#mYes").onclick = () => { $("#modalScrim").classList.remove("on"); onYes(); };
 }
 
+function infoModal(title, html) {
+  $("#mTitle").textContent = title;
+  $("#mText").innerHTML = html;
+  $("#modalScrim").classList.add("on");
+  $("#mYes").textContent = "关闭";
+  $("#mNo").textContent = "取消";
+  $("#mNo").onclick = $("#mYes").onclick = () => $("#modalScrim").classList.remove("on");
+}
+
 function applyTheme() {
   const light = themeMode === 0 || (themeMode === 2 && !matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.setAttribute("data-theme", light ? "light" : "dark");
@@ -120,11 +129,13 @@ async function loadDetail() {
 }
 
 function factCard(uid, f, i) {
+  const src = f.sources || [];
   return `<div class="card fact ${f.pinned ? "pinned" : ""}" data-i="${i}">
     <div class="k">${esc(f.key || "")}</div>
-    <div class="v">${esc(f.value)}</div>
+    <div class="v">${esc(f.value)}${f.verified === false ? ' <span class="badge" style="color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,var(--border))">未验证</span>' : ""}</div>
     <div class="bar" title="重要度 ${f.importance ?? 50}"><i style="width:${Math.max(0, Math.min(100, f.importance ?? 50))}%"></i></div>
     <div class="star" data-pin="${i}" title="置顶">${f.pinned ? "★" : "☆"}</div>
+    <button class="mini" data-src="${i}" title="查看该事实的来源事件">溯源${src.length ? `(${src.length})` : ""}</button>
     <button class="mini" data-edit="${i}">编辑</button>
     <button class="mini danger" data-fdel="${i}">删除</button>
   </div>`;
@@ -182,11 +193,11 @@ function renderDetail(user, events) {
 
   d.querySelector("#dExp").onclick = async () => {
     try {
-      const data = await apiGet("export");
+      const data = await apiGet("export", { user_id: uid });
       const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
       const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `memory_${uid}.json`; a.click(); URL.revokeObjectURL(a.href);
-      toast("已导出");
-    } catch (e) {}
+      toast("已导出该用户记忆");
+    } catch (e) { toast("导出失败：" + e.message); }
   };
   d.querySelector("#dDel").onclick = () => confirmModal("删除该用户全部记忆", `确认删除 ${uid} 的所有记忆？`, async () => {
     await apiPost("forget", { user_id: uid });
@@ -245,6 +256,19 @@ function renderDetail(user, events) {
       toast("已保存"); loadDetail();
     };
   }));
+  d.querySelectorAll("[data-src]").forEach((el) => (el.onclick = async () => {
+    const i = +el.dataset.src; const f = facts[i];
+    const ids = (f.sources || []).join(",");
+    if (!ids) return infoModal("溯源", "这条事实没有可追溯的来源事件（可能由旧版本整理或未验证）。");
+    try {
+      const data = await apiGet("event/sources", { user_id: uid, ids });
+      const evs = (data && data.events) || [];
+      const html = evs.length
+        ? evs.map((e) => `<div style="margin-bottom:8px"><b>#${e.id}</b> · ${esc(short(e.ts))} · ${esc(e.scene || "")}<br/>${esc(e.content)}</div>`).join("")
+        : "未找到对应事件（可能已被删除或迁移到冷层）。";
+      infoModal("溯源 · " + esc(f.value), html);
+    } catch (e) { toast("溯源失败：" + e.message); }
+  }));
   d.querySelectorAll("[data-fdel]").forEach((el) => (el.onclick = () => {
     const f = facts[+el.dataset.fdel];
     confirmModal("删除事实", `确认删除：${f.value}？`, async () => {
@@ -298,8 +322,8 @@ $("#exp").onclick = async () => {
     const data = await apiGet("export");
     const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "user_memory_export.json"; a.click(); URL.revokeObjectURL(a.href);
-    toast("已导出");
-  } catch (e) {}
+    toast("已导出整库");
+  } catch (e) { toast("导出失败：" + e.message); }
 };
 $("#imp").onchange = async (ev) => {
   const f = ev.target.files[0]; if (!f) return;
