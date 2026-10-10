@@ -29,6 +29,11 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
 try:
+    from astrbot.api.message_components import At, Plain, Reply
+except Exception:  # pragma: no cover
+    from astrbot.core.message.components import At, Plain, Reply  # type: ignore
+
+try:
     from astrbot.core.agent.message import TextPart
 except Exception:  # pragma: no cover
     TextPart = None  # type: ignore
@@ -89,7 +94,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -160,7 +165,10 @@ CREATE TABLE IF NOT EXISTS events(
   content TEXT NOT NULL,
   importance INTEGER NOT NULL DEFAULT 30,
   ref_msg_id TEXT,
-  migrated INTEGER NOT NULL DEFAULT 0
+  migrated INTEGER NOT NULL DEFAULT 0,
+  speaker_name TEXT DEFAULT '',
+  is_bot INTEGER NOT NULL DEFAULT 0,
+  addressed TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
@@ -276,7 +284,22 @@ class _Store:
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA busy_timeout=30000")
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self):
+        """为旧库补齐新列（events 说话人/bot/对象）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(events)").fetchall()}
+        for name, ddl in (
+            ("speaker_name", "ALTER TABLE events ADD COLUMN speaker_name TEXT DEFAULT ''"),
+            ("is_bot", "ALTER TABLE events ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0"),
+            ("addressed", "ALTER TABLE events ADD COLUMN addressed TEXT DEFAULT ''"),
+        ):
+            if name not in cols:
+                try:
+                    self.conn.execute(ddl)
+                except Exception:
+                    pass
 
     def checkpoint(self):
         with self._lock:
@@ -396,15 +419,63 @@ class _Store:
             except Exception:
                 pass
 
-    def append_event(self, user_id, scene, kind, content, importance, ref_msg_id=""):
+    def append_event(
+        self,
+        user_id,
+        scene,
+        kind,
+        content,
+        importance,
+        ref_msg_id="",
+        speaker_name="",
+        is_bot=0,
+        addressed="",
+    ):
         with self._lock:
             cur = self.conn.execute(
-                "INSERT INTO events(user_id,ts,scene,kind,content,importance,ref_msg_id)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (user_id, int(time.time()), scene, kind, content, importance, ref_msg_id),
+                "INSERT INTO events(user_id,ts,scene,kind,content,importance,ref_msg_id,"
+                "speaker_name,is_bot,addressed) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    user_id,
+                    int(time.time()),
+                    scene,
+                    kind,
+                    content,
+                    importance,
+                    ref_msg_id,
+                    speaker_name,
+                    int(is_bot),
+                    addressed,
+                ),
             )
             self.conn.commit()
             return cur.lastrowid
+
+    def kv_set(self, k, v):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO kv_state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (str(k), str(v)),
+            )
+            self.conn.commit()
+
+    def kv_get(self, k, default=""):
+        with self._lock:
+            row = self.conn.execute("SELECT v FROM kv_state WHERE k=?", (str(k),)).fetchone()
+            return row["v"] if row else default
+
+    def context_events(self, scenes, ts_from, limit=60):
+        """同场景、窗口内的其他发言（含机器人），用于整理时理解语境。"""
+        if not scenes:
+            return []
+        q = ",".join("?" for _ in scenes)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT ts,scene,content,speaker_name,is_bot,user_id FROM events"
+                f" WHERE ts>=? AND scene IN ({q}) ORDER BY ts ASC LIMIT ?",
+                [ts_from, *list(scenes), limit],
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def ensure_user(self, user_id):
         with self._lock:
@@ -533,7 +604,8 @@ class _Store:
                 " (SELECT MAX(ts) FROM events WHERE user_id=u.user_id) AS last_ts,"
                 " (SELECT 1 FROM inject_cache WHERE user_id=u.user_id AND text IS NOT NULL"
                 " AND text!='' LIMIT 1) AS has_text"
-                " FROM (SELECT user_id FROM users UNION SELECT DISTINCT user_id FROM events) u"
+                " FROM (SELECT user_id FROM users UNION SELECT DISTINCT user_id FROM events"
+                " WHERE is_bot=0) u"
                 " ORDER BY last_ts DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -683,7 +755,7 @@ class _Store:
         with self._lock:
             for r in self.conn.execute(
                 "SELECT e.user_id AS user_id, COUNT(*) AS events, MAX(e.ts) AS last_ts"
-                " FROM events e WHERE e.content LIKE ? GROUP BY e.user_id"
+                " FROM events e WHERE e.content LIKE ? AND e.is_bot=0 GROUP BY e.user_id"
                 " ORDER BY last_ts DESC LIMIT ?",
                 (like, limit),
             ).fetchall():
@@ -1012,20 +1084,44 @@ class UserMemoryPlugin(Star):
         if not self.cfg("enable"):
             return
         try:
-            if str(event.get_self_id()) == str(event.get_sender_id()):
-                return
+            sid = str(event.get_sender_id())
+            self_id = str(event.get_self_id())
+            is_bot = sid == self_id
             store = self._get_store()
             if store is None:
                 return
-            user_id = str(event.get_sender_id())
-            await self._db(store.ensure_user, user_id)
+            user_id = sid
             nick = self._sender_name(event)
-            if nick:
-                await self._db(store.set_alias, user_id, nick)
             text = self._clean_text(event.message_str or "")
             if not self._is_meaningful(text):
                 return
             scene = self._scene(event)
+            addressed = self._addressed(event)
+            mid = str(getattr(event.message_obj, "message_id", "") or "")
+            if is_bot:
+                # 机器人自己的发言：只作为“对话上下文”记录，不为它建档
+                await self._db(
+                    store.append_event,
+                    user_id,
+                    scene,
+                    "bot",
+                    text[:1000],
+                    30,
+                    mid,
+                    nick,
+                    1,
+                    addressed,
+                )
+                try:
+                    await self._db(store.kv_set, "bot_id", self_id)
+                    if nick:
+                        await self._db(store.kv_set, "bot_name", nick)
+                except Exception:
+                    pass
+                return
+            await self._db(store.ensure_user, user_id)
+            if nick:
+                await self._db(store.set_alias, user_id, nick)
             importance = self._estimate_importance(text)
             if importance < _safe_int(self.cfg("event_min_importance"), 5):
                 return
@@ -1036,7 +1132,10 @@ class UserMemoryPlugin(Star):
                 "said",
                 text[:1000],
                 importance,
-                str(getattr(event.message_obj, "message_id", "") or ""),
+                mid,
+                nick,
+                0,
+                addressed,
             )
             # 即时记忆：用户明确要求“记住”时立刻写入 pinned fact（无 LLM，下一轮即注入）
             try:
@@ -1085,6 +1184,24 @@ class UserMemoryPlugin(Star):
             return False
 
     _AT_RE = re.compile(r"@[^\s@()]{1,40}\(\s*\d{4,}\s*\)|\[CQ:[^\]]*\]|<@!?\d+>")
+
+    @staticmethod
+    def _addressed(event) -> str:
+        """提取本条消息指向的对象（@某人 / 引用回复）。"""
+        parts = []
+        try:
+            for comp in getattr(event.message_obj, "message", []) or []:
+                if isinstance(comp, At):
+                    q = getattr(comp, "qq", None)
+                    if q:
+                        parts.append(f"@{q}")
+                elif isinstance(comp, Reply):
+                    s = getattr(comp, "sender_id", None)
+                    if s:
+                        parts.append(f"reply:{s}")
+        except Exception:
+            pass
+        return " ".join(parts)[:120]
 
     def _clean_text(self, text: str) -> str:
         """去除 @提及/CQ码 等噪音（避免他人身份泄漏进本人记忆）。"""
@@ -1189,8 +1306,30 @@ class UserMemoryPlugin(Star):
                 blocks = await self._db(store.list_blocks, user_id)
             except Exception:
                 blocks = []
+            try:
+                bot_id = await self._db(store.kv_get, "bot_id", "")
+                bot_name = await self._db(store.kv_get, "bot_name", "")
+            except Exception:
+                bot_id, bot_name = "", ""
+            ctx_events = []
+            try:
+                scenes = sorted({e["scene"] for e in events})
+                ts_from = (events[0]["ts"] - 600) if events else int(time.time()) - 3600
+                ctx_events = await self._db(store.context_events, scenes, ts_from, 60)
+            except Exception:
+                ctx_events = []
             result = await self._llm_consolidate(
-                facts, narrative, events, user_id, nickname, blocks
+                facts,
+                narrative,
+                events,
+                {
+                    "user_id": user_id,
+                    "nickname": nickname,
+                    "blocks": blocks,
+                    "bot_id": bot_id,
+                    "bot_name": bot_name,
+                    "ctx_events": ctx_events,
+                },
             )
             if not result:
                 return
@@ -1287,9 +1426,8 @@ class UserMemoryPlugin(Star):
             )
         return out
 
-    async def _llm_consolidate(
-        self, facts, narrative, events, user_id="", nickname="", blocks=None
-    ):
+    async def _llm_consolidate(self, facts, narrative, events, ctx=None):
+        ctx = ctx or {}
         provider_id = str(self.cfg("consolidate_provider_id") or "").strip()
         if not provider_id:
             try:
@@ -1299,12 +1437,25 @@ class UserMemoryPlugin(Star):
         if not provider_id:
             return None
 
-        lines = []
-        for e in events:
-            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["ts"]))
-            lines.append(f"- [{ts}][{e['scene']}] {e['content']}")
-        events_text = "\n".join(lines)
+        uid = str(ctx.get("user_id") or "")
+        nickname = str(ctx.get("nickname") or "")
+        bot_id = str(ctx.get("bot_id") or "")
+        bot_name = str(ctx.get("bot_name") or "")
+        blocks = ctx.get("blocks") or []
+        ctx_events = ctx.get("ctx_events") or []
 
+        def fmt(e):
+            ts = time.strftime("%m-%d %H:%M", time.localtime(e["ts"]))
+            if e.get("is_bot"):
+                who = e.get("speaker_name") or bot_name or e.get("user_id", "")
+                tag = "机器人"
+            else:
+                who = e.get("speaker_name") or e.get("user_id", "")
+                tag = f"用户{e.get('user_id','')}"
+            return f"- [{ts}][{e.get('scene','')}] {who}({tag})：{e.get('content','')}"
+
+        events_text = "\n".join(fmt(e) for e in events) or "（无）"
+        ctx_text = "\n".join(fmt(e) for e in ctx_events) or "（无）"
         blocks_text = ""
         if blocks:
             blocks_text = (
@@ -1314,25 +1465,29 @@ class UserMemoryPlugin(Star):
             )
 
         prompt = (
-            "你是记忆整理助手。基于【已有画像】与【新增事件】，更新该用户的记忆。\n"
+            "你是用户记忆整理助手。只依据【角色】、【本人发言】与【对话上下文】更新【本人】的记忆。\n"
             "只输出 JSON，无多余文字：\n"
             '{"facts":[{"key":"","value":"","importance":0-100,"tags":[""],'
-            '"pinned":false,"updated_ts":0}],"narrative":"","inject_text":""}\n'
-            "【本档案的主人（必须锚定，勿混淆）】\n"
-            f"- user_id（QQ号）：{user_id}\n"
-            f"- 当前昵称：{nickname or '（未知）'}\n"
-            "硬性规则：\n"
-            "1) 只记录“本人”的信息；事件文本中出现的其他昵称/QQ号均属于他人。\n"
-            "2) 严禁把他人的昵称、QQ、喜好、关系写成本人的 facts（最常见错误：把被 @ 的人当成本人）。\n"
-            "3) 本人身份一律以给定的 user_id / 昵称为准。\n\n" + blocks_text +
+            '"pinned":false,"updated_ts":0}],"narrative":"","inject_text":""}\n\n'
+            "【角色（只能使用这些身份，不得编造）】\n"
+            f"- 本人：昵称={nickname or '（未知）'}，QQ={uid}\n"
+            f"- 本机器人：昵称={bot_name or '（未知）'}，QQ={bot_id or '（未知）'}（只有一个机器人，不存在“二号/三号”）\n"
+            "对话中其他参与者以 昵称(QQ) 或 QQ 标注。\n\n"
+            "硬性规则（必须遵守，违反即为错误）：\n"
+            "1) 只记录【本人】的信息；不得为他人建档。\n"
+            "2) 严禁编造人名、机器人编号或身份；只能用【角色】或文本中出现过的 QQ/昵称。\n"
+            "3) 只依据给定文本；不确定就不要写（宁缺毋滥）。\n"
+            "4) 本人身份一律以给定的 QQ/昵称为准。\n"
+            "5) 关系类描述必须带明确对象 QQ（如“常与 1145140011 互动”）；没有明确对象就不写关系。\n"
+            "6) 不要把同一个人拆成多个；机器人只有一个。\n\n" + blocks_text +
+            "【本人发言（待整理）】\n" + events_text + "\n\n"
+            "【对话上下文（仅供理解语境，不要为其中人物建立记忆）】\n" + ctx_text + "\n\n"
+            "【已有 facts】\n" + json.dumps(facts, ensure_ascii=False) + "\n\n"
+            "【已有 narrative】\n" + narrative + "\n\n"
             "要求：\n"
-            "1. facts = 稳定事实（身份/偏好/关系/习惯）。去重、合并、冲突以新为准；\n"
-            "   importance 表示长期重要度；tags 为检索关键词；updated_ts 为 Unix 秒（可留 0）。\n"
-            "2. narrative = 最近发生了什么（≤200字）。\n"
-            "3. inject_text = 可直接注入 prompt 的语境文本（≤400字，无 markdown 标题）。\n\n"
-            f"【已有 facts】\n{json.dumps(facts, ensure_ascii=False)}\n\n"
-            f"【已有 narrative】\n{narrative}\n\n"
-            f"【新增事件】\n{events_text}\n"
+            "1. facts = 本人稳定事实（身份/偏好/关系/习惯）。去重合并、冲突以新为准；importance 0-100；tags 关键词；updated_ts 可留 0。\n"
+            "2. narrative = 本人最近发生了什么（≤200字）。\n"
+            "3. inject_text = 可直接注入的语境（≤400字，无 markdown 标题）。\n"
         )
         try:
             resp = await asyncio.wait_for(
@@ -1834,6 +1989,11 @@ class UserMemoryPlugin(Star):
             users = await self._db(store.list_users, min(limit, 500))
         else:
             users = await self._db(store.search_users, q, min(limit, 500))
+        for u in users:
+            try:
+                u["protected"] = self._is_protected(u.get("user_id"))
+            except Exception:
+                u["protected"] = False
         return json_response({"users": users})
 
     async def api_providers(self):
@@ -1911,6 +2071,11 @@ class UserMemoryPlugin(Star):
             return error_response(self._storage_error())
         limit = request.query.get("limit", 200, type=int) or 200
         users = await self._db(store.list_users, max(1, min(limit, 500)))
+        for u in users:
+            try:
+                u["protected"] = self._is_protected(u.get("user_id"))
+            except Exception:
+                u["protected"] = False
         return json_response({"users": users})
 
     async def api_user(self):
