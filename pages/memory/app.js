@@ -74,10 +74,42 @@ function renderUsers(kw) {
     li.dataset.uid = u.user_id;
     if (u.user_id === currentUid) li.classList.add("active");
     const tag = u.matched === "fact" ? " · 命中事实" : u.matched === "event" ? " · 命中事件" : "";
-    li.innerHTML = `${esc(u.user_id)}<div class="sub">事件 ${u.events ?? 0} · 冷层 ${u.chunks ?? 0}${tag} · ${fmt(u.last_ts)}</div>`;
+    const head = document.createElement("div");
+    head.className = "uhead";
+    const name = document.createElement("span");
+    name.textContent = u.user_id;
+    const del = document.createElement("button");
+    del.className = "mini-danger";
+    del.textContent = "删除";
+    del.onclick = (ev) => {
+      ev.stopPropagation();
+      if (del.dataset.confirm !== "1") {
+        del.dataset.confirm = "1";
+        del.textContent = "确认删除?";
+        return;
+      }
+      deleteUser(u.user_id);
+    };
+    head.append(name, del);
+    const sub2 = document.createElement("div");
+    sub2.className = "sub";
+    sub2.textContent = `事件 ${u.events ?? 0} · 冷层 ${u.chunks ?? 0}${tag} · ${fmt(u.last_ts)}`;
+    li.append(head, sub2);
     li.onclick = () => loadDetail(u.user_id);
     usersEl.appendChild(li);
   }
+}
+
+async function deleteUser(uid) {
+  try {
+    await api("forget", { user_id: uid });
+    toast("已删除 " + uid + " 的记忆");
+    if (currentUid === uid) {
+      currentUid = null;
+      detailEl.innerHTML = '<div class="muted">已删除</div>';
+    }
+    loadUsers();
+  } catch (e) {}
 }
 
 async function loadDetail(uid) {
@@ -328,13 +360,43 @@ async function renderSettings() {
       <select id="sel-emb"><option value="">（默认/自动）</option>${embs.map((o) => opt(o, cur.embedding_provider_id)).join("")}</select>
       <label>重排模型</label>
       <select id="sel-rr"><option value="">（默认/自动）</option>${rrs.map((o) => opt(o, cur.rerank_provider_id)).join("")}</select>
-      <button id="save-prov">保存模型设置</button>`;
+      <button id="save-prov">保存模型设置</button>
+      <h2>备份与迁移</h2>
+      <button id="exp">导出记忆(JSON)</button>
+      <label class="file-label">导入记忆(JSON)<input id="imp" type="file" accept=".json,application/json" /></label>`;
     box.querySelector("#save-prov").onclick = async () => {
       await api("providers/save", {
         embedding_provider_id: box.querySelector("#sel-emb").value,
         rerank_provider_id: box.querySelector("#sel-rr").value,
       });
       toast("已保存模型设置");
+    };
+    box.querySelector("#exp").onclick = async () => {
+      try {
+        const data = pick(await bridge.apiGet("export"));
+        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "user_memory_export.json";
+        a.click();
+        URL.revokeObjectURL(a.href);
+        toast("已导出");
+      } catch (e) {}
+    };
+    box.querySelector("#imp").onchange = async (ev) => {
+      const f = ev.target.files[0];
+      if (!f) return;
+      const text = await f.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        toast("JSON 解析失败");
+        return;
+      }
+      await api("import", { data });
+      toast("已导入");
+      loadUsers();
     };
   } catch (e) {
     box.innerHTML = '<h2>模型设置</h2><div class="muted">加载失败</div>';

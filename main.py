@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
 import json
 import math
 import os
@@ -87,7 +89,15 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.4.0"
+__version__ = "1.5.0"
+
+# 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
+_DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="um-db"
+)
+_DB_LOCK = threading.RLock()
+_STORE_REGISTRY: dict = {}
+_STORE_REGISTRY_LOCK = threading.Lock()
 
 DEFAULTS = {
     "enable": True,
@@ -135,6 +145,9 @@ DEFAULTS = {
     "superadmin_ids": [],
     # 受保护用户：普通管理员不可查看
     "protected_ids": [],
+    # 启动时自动备份（VACUUM INTO）与保留天数
+    "backup_on_start": True,
+    "backup_keep_days": 7,
 }
 
 SCHEMA = """
@@ -253,14 +266,128 @@ class _Store:
     """SQLite 存储；方法为同步，调用方用 asyncio.to_thread 包装。"""
 
     def __init__(self, db_path: str):
-        self._lock = threading.Lock()
+        self.db_path = db_path
+        self._lock = _DB_LOCK
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         with self._lock:
-            self.conn.executescript(SCHEMA)
             self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            self.conn.executescript(SCHEMA)
             self.conn.commit()
+
+    def checkpoint(self):
+        with self._lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self.conn.commit()
+            except Exception:
+                pass
+
+    def integrity_ok(self) -> bool:
+        with self._lock:
+            try:
+                row = self.conn.execute("PRAGMA quick_check").fetchone()
+                return bool(row) and str(row[0]).lower() == "ok"
+            except Exception:
+                return False
+
+    def backup_to(self, path: str) -> bool:
+        with self._lock:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                safe = str(path).replace("'", "''")
+                self.conn.execute(f"VACUUM INTO '{safe}'")
+                return True
+            except Exception:
+                return False
+
+    def export_all(self):
+        with self._lock:
+            def rows(sql):
+                return [dict(r) for r in self.conn.execute(sql).fetchall()]
+
+            return {
+                "exported_at": int(time.time()),
+                "version": __version__,
+                "users": rows("SELECT * FROM users"),
+                "events": rows("SELECT * FROM events"),
+                "inject_cache": rows("SELECT * FROM inject_cache"),
+                "mem_chunks": rows("SELECT * FROM mem_chunks"),
+                "blocklist": rows("SELECT user_id,text,ts FROM blocklist"),
+            }
+
+    def import_all(self, data) -> int:
+        n = 0
+        with self._lock:
+            for r in data.get("users", []) or []:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO users(user_id,aliases,facts,narrative,stats,relations,"
+                    "last_event_cursor,last_consolidate_ts,schema_version) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        r.get("user_id"),
+                        r.get("aliases", "[]"),
+                        r.get("facts", "[]"),
+                        r.get("narrative", ""),
+                        r.get("stats", "{}"),
+                        r.get("relations", "{}"),
+                        _safe_int(r.get("last_event_cursor"), 0),
+                        _safe_int(r.get("last_consolidate_ts"), 0),
+                        _safe_int(r.get("schema_version"), 1),
+                    ),
+                )
+                n += 1
+            for r in data.get("inject_cache", []) or []:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO inject_cache(user_id,text,updated_ts,version) VALUES(?,?,?,?)",
+                    (
+                        r.get("user_id"),
+                        r.get("text", ""),
+                        _safe_int(r.get("updated_ts"), 0),
+                        _safe_int(r.get("version"), 1),
+                    ),
+                )
+                n += 1
+            for r in data.get("events", []) or []:
+                self.conn.execute(
+                    "INSERT INTO events(user_id,ts,scene,kind,content,importance,ref_msg_id,migrated)"
+                    " VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        r.get("user_id"),
+                        _safe_int(r.get("ts"), 0),
+                        r.get("scene", ""),
+                        r.get("kind", "said"),
+                        r.get("content", ""),
+                        _safe_int(r.get("importance"), 30),
+                        r.get("ref_msg_id", ""),
+                        _safe_int(r.get("migrated"), 0),
+                    ),
+                )
+                n += 1
+            for r in data.get("mem_chunks", []) or []:
+                self.conn.execute(
+                    "INSERT INTO mem_chunks(user_id,text,ts,source_event_ids,embedding,migrated_at)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (
+                        r.get("user_id"),
+                        r.get("text", ""),
+                        _safe_int(r.get("ts"), 0),
+                        r.get("source_event_ids", "[]"),
+                        r.get("embedding", "[]"),
+                        _safe_int(r.get("migrated_at"), 0),
+                    ),
+                )
+                n += 1
+            for r in data.get("blocklist", []) or []:
+                self.conn.execute(
+                    "INSERT INTO blocklist(user_id,text,ts) VALUES(?,?,?)",
+                    (r.get("user_id"), r.get("text", ""), _safe_int(r.get("ts"), 0)),
+                )
+                n += 1
+            self.conn.commit()
+        return n
 
     def close(self):
         with self._lock:
@@ -374,6 +501,7 @@ class _Store:
             self.conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
             self.conn.execute("DELETE FROM inject_cache WHERE user_id=?", (user_id,))
             self.conn.execute("DELETE FROM mem_chunks WHERE user_id=?", (user_id,))
+            self.conn.execute("DELETE FROM blocklist WHERE user_id=?", (user_id,))
             self.conn.commit()
 
     def add_fact(self, user_id, fact):
@@ -617,6 +745,16 @@ class _Store:
             return {"events": ev, "chunks": ch}
 
 
+def _open_store(db_path: str) -> "_Store":
+    """按路径返回单例 Store，避免热重载产生多个连接。"""
+    with _STORE_REGISTRY_LOCK:
+        st = _STORE_REGISTRY.get(db_path)
+        if st is None:
+            st = _Store(db_path)
+            _STORE_REGISTRY[db_path] = st
+        return st
+
+
 class UserMemoryPlugin(Star):
     """以用户为单位的分层记忆插件。"""
 
@@ -628,47 +766,57 @@ class UserMemoryPlugin(Star):
                 self.config.setdefault(k, v)
             except Exception:
                 pass
+        self._closing = False
+        self._db_path: str | None = None
+        self._db_dir: str | None = None
+        self._last_backup_date: str | None = None
         self._store: _Store | None = None
         self._idle_tasks: dict[str, asyncio.Task] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._consolidate_times: dict[str, list[float]] = {}
         try:
             if request is not None:
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/users", self.api_users, ["GET"], "List users"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/user", self.api_user, ["GET"], "User detail"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/forget", self.api_forget, ["POST"], "Forget user"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/meta", self.api_meta, ["GET"], "Plugin meta"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/fact/add", self.api_fact_add, ["POST"], "Add fact"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/fact/update", self.api_fact_update, ["POST"], "Update fact"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/fact/delete", self.api_fact_delete, ["POST"], "Delete fact"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/inject/save", self.api_inject_save, ["POST"], "Save inject text"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/event/delete", self.api_event_delete, ["POST"], "Delete event"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/search", self.api_search, ["GET"], "Search memory"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/providers", self.api_providers, ["GET"], "List providers"
                 )
-                self.context.register_web_api(
+                self._reg(
                     f"/{PLUGIN_NAME}/providers/save", self.api_providers_save, ["POST"], "Save providers"
+                )
+                self._reg(
+                    f"/{PLUGIN_NAME}/export", self.api_export, ["GET"], "Export memory"
+                )
+                self._reg(
+                    f"/{PLUGIN_NAME}/import", self.api_import, ["POST"], "Import memory"
                 )
         except Exception as e:
             logger.warning(f"[用户记忆] 注册 Web API 失败: {e}")
@@ -692,13 +840,109 @@ class UserMemoryPlugin(Star):
                 if get_astrbot_plugin_data_path
                 else os.path.join(os.getcwd(), "data", "plugin_data")
             )
-            db_path = os.path.join(base, PLUGIN_NAME, "memory.db")
-            self._store = _Store(db_path)
-            logger.info(f"[用户记忆] 存储已就绪: {db_path}")
+            self._db_dir = os.path.join(base, PLUGIN_NAME)
+            self._db_path = os.path.join(self._db_dir, "memory.db")
+            self._store = _open_store(self._db_path)
+            if not self._store.integrity_ok():
+                logger.error("[用户记忆] 完整性检查失败，尝试自愈重建。")
+                self._heal_db_sync()
+            else:
+                self._maybe_backup()
+            logger.info(f"[用户记忆] 存储已就绪: {self._db_path}")
         except Exception as e:
             logger.error(f"[用户记忆] 初始化存储失败: {e}", exc_info=True)
             return None
         return self._store
+
+    async def _db(self, fn, *args):
+        """在专用单线程中串行执行数据库操作；捕获损坏则自愈。"""
+        if self._closing:
+            raise RuntimeError("插件正在关闭")
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(_DB_EXECUTOR, functools.partial(fn, *args))
+        except sqlite3.DatabaseError as e:
+            msg = str(e).lower()
+            if "malformed" in msg or "corrupt" in msg or "not a database" in msg:
+                logger.error(f"[用户记忆] 数据库损坏：{e}；执行自愈。")
+                await loop.run_in_executor(_DB_EXECUTOR, self._heal_db_sync)
+            raise
+
+    def _heal_db_sync(self):
+        path = self._db_path
+        if not path:
+            return
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            with _STORE_REGISTRY_LOCK:
+                old = _STORE_REGISTRY.pop(path, None)
+            if old is not None:
+                try:
+                    old.conn.close()
+                except Exception:
+                    pass
+            for suffix in ("", "-wal", "-shm"):
+                src = path + suffix
+                if os.path.exists(src):
+                    try:
+                        os.replace(src, f"{src}.corrupt.{ts}")
+                    except Exception:
+                        pass
+            self._store = _open_store(path)
+            logger.error(f"[用户记忆] 已自愈重建数据库（旧库改名 .corrupt.{ts}）")
+        except Exception as e:
+            logger.error(f"[用户记忆] 自愈失败: {e}")
+
+    def _maybe_backup(self):
+        if not self.cfg("backup_on_start") or not self._db_dir or self._store is None:
+            return
+        today = time.strftime("%Y%m%d")
+        if self._last_backup_date == today:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._last_backup_date = today
+        bdir = os.path.join(self._db_dir, "backups")
+        path = os.path.join(bdir, f"memory-{today}.db")
+        keep = max(1, _safe_int(self.cfg("backup_keep_days"), 7))
+        store = self._store
+
+        def _do():
+            store.backup_to(path)
+            try:
+                files = sorted(
+                    f
+                    for f in os.listdir(bdir)
+                    if f.startswith("memory-") and f.endswith(".db")
+                )
+                for f in files[:-keep]:
+                    try:
+                        os.remove(os.path.join(bdir, f))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return True
+
+        try:
+            loop.create_task(self._db(_do))
+        except Exception:
+            pass
+
+    def _reg(self, route, handler, methods, desc):
+        async def _wrapped(*args, **kwargs):
+            try:
+                return await handler(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"[用户记忆] API {route} 出错: {e}", exc_info=True)
+                return error_response(f"插件内部错误：{e}", 500)
+
+        try:
+            self.context.register_web_api(route, _wrapped, methods, desc)
+        except Exception as e:
+            logger.warning(f"[用户记忆] 注册 Web API 失败 {route}: {e}")
 
     def _lock(self, user_id: str) -> asyncio.Lock:
         if user_id not in self._locks:
@@ -724,10 +968,10 @@ class UserMemoryPlugin(Star):
             if store is None:
                 return
             user_id = str(event.get_sender_id())
-            await asyncio.to_thread(store.ensure_user, user_id)
+            await self._db(store.ensure_user, user_id)
             nick = self._sender_name(event)
             if nick:
-                await asyncio.to_thread(store.set_alias, user_id, nick)
+                await self._db(store.set_alias, user_id, nick)
             text = self._clean_text(event.message_str or "")
             if not self._is_meaningful(text):
                 return
@@ -735,7 +979,7 @@ class UserMemoryPlugin(Star):
             importance = self._estimate_importance(text)
             if importance < _safe_int(self.cfg("event_min_importance"), 5):
                 return
-            await asyncio.to_thread(
+            await self._db(
                 store.append_event,
                 user_id,
                 scene,
@@ -757,8 +1001,8 @@ class UserMemoryPlugin(Star):
                             "pinned": True,
                             "updated_ts": int(time.time()),
                         }
-                        await asyncio.to_thread(store.ensure_user, user_id)
-                        await asyncio.to_thread(store.add_fact, user_id, fact)
+                        await self._db(store.ensure_user, user_id)
+                        await self._db(store.add_fact, user_id, fact)
                         if self.cfg("debug"):
                             logger.info(f"[用户记忆] 即时记忆已写入: {payload_text[:40]}")
                         try:
@@ -877,22 +1121,22 @@ class UserMemoryPlugin(Star):
             return
 
         async with self._lock(user_id):
-            await asyncio.to_thread(store.ensure_user, user_id)
-            user = await asyncio.to_thread(store.get_user, user_id)
+            await self._db(store.ensure_user, user_id)
+            user = await self._db(store.get_user, user_id)
             cursor = _safe_int(user.get("last_event_cursor"), 0) if user else 0
             max_events = _safe_int(self.cfg("consolidate_max_events"), 40)
-            events = await asyncio.to_thread(store.new_events, user_id, cursor, max_events)
+            events = await self._db(store.new_events, user_id, cursor, max_events)
             if not events:
                 return
 
             facts = self._load_facts(user)
             narrative = (user.get("narrative") or "") if user else ""
             try:
-                nickname = await asyncio.to_thread(store.nickname, user_id)
+                nickname = await self._db(store.nickname, user_id)
             except Exception:
                 nickname = ""
             try:
-                blocks = await asyncio.to_thread(store.list_blocks, user_id)
+                blocks = await self._db(store.list_blocks, user_id)
             except Exception:
                 blocks = []
             result = await self._llm_consolidate(
@@ -912,7 +1156,7 @@ class UserMemoryPlugin(Star):
             ctx_text = (result.get("inject_text", "") or "")[
                 : _safe_int(self.cfg("inject_text_max_chars"), 1200)
             ]
-            await asyncio.to_thread(
+            await self._db(
                 store.save_consolidation,
                 user_id,
                 new_facts,
@@ -1079,7 +1323,7 @@ class UserMemoryPlugin(Star):
         return age_days > decay_days and imp < floor
 
     async def _build_injection(self, user_id: str, msg: str, store: _Store) -> str:
-        user = await asyncio.to_thread(store.get_user, user_id)
+        user = await self._db(store.get_user, user_id)
         if not user:
             return ""
         now = time.time()
@@ -1092,7 +1336,7 @@ class UserMemoryPlugin(Star):
         facts = facts[:max_facts]
 
         tl_floor = _safe_int(self.cfg("timeline_min_importance"), 10)
-        raw_events = await asyncio.to_thread(store.recent_events, user_id, max_tl * 3)
+        raw_events = await self._db(store.recent_events, user_id, max_tl * 3)
         recent = [e for e in raw_events if _safe_int(e.get("importance", 0)) >= tl_floor][
             :max_tl
         ]
@@ -1100,7 +1344,7 @@ class UserMemoryPlugin(Star):
 
         ctx = ""
         try:
-            ctx = await asyncio.to_thread(store.get_inject_text, user_id) or ""
+            ctx = await self._db(store.get_inject_text, user_id) or ""
         except Exception:
             ctx = ""
 
@@ -1169,7 +1413,7 @@ class UserMemoryPlugin(Star):
     async def _cold_migrate(self, user_id: str, store: _Store):
         days = _safe_int(self.cfg("cold_migrate_days"), 30)
         before = int(time.time()) - days * 86400
-        rows = await asyncio.to_thread(store.stale_events, user_id, before, 50)
+        rows = await self._db(store.stale_events, user_id, before, 50)
         if not rows:
             return
         limit = max(100, _safe_int(self.cfg("chunk_chars"), 400))
@@ -1189,7 +1433,7 @@ class UserMemoryPlugin(Star):
             if emb:
                 items.append(("\n".join(buf), buf_ts, srcs, emb))
         if items:
-            await asyncio.to_thread(store.add_chunks, user_id, items)
+            await self._db(store.add_chunks, user_id, items)
             logger.info(f"[用户记忆] 冷层迁移 {len(items)} 块 (user={user_id})")
 
     async def _cold_retrieve(self, user_id: str, query: str) -> str:
@@ -1197,7 +1441,7 @@ class UserMemoryPlugin(Star):
         if store is None:
             return ""
         qemb = await self._embed(query)
-        rows = await asyncio.to_thread(store.chunks_for_user, user_id)
+        rows = await self._db(store.chunks_for_user, user_id)
         if not rows:
             return ""
         top_k = _safe_int(self.cfg("cold_retrieve_top_k"), 5)
@@ -1302,7 +1546,7 @@ class UserMemoryPlugin(Star):
         arg = tokens[0].strip().lower() if tokens else ""
 
         if arg in ("forget", "删除", "清除"):
-            await asyncio.to_thread(store.forget_user, user_id)
+            await self._db(store.forget_user, user_id)
             yield event.plain_result("已删除你的全部记忆。")
             return
         if arg in ("now", "整理"):
@@ -1320,15 +1564,15 @@ class UserMemoryPlugin(Star):
             if not self._can_view(event, target):
                 yield event.plain_result("权限不足：无权查看该用户记忆。")
                 return
-            detail = await asyncio.to_thread(store.get_detail, target)
-            events = await asyncio.to_thread(store.list_events, target, 10)
+            detail = await self._db(store.get_detail, target)
+            events = await self._db(store.list_events, target, 10)
             yield event.plain_result(self._format_detail(target, detail, events))
             return
         if arg in ("list", "列表"):
             if not self._is_admin(event):
                 yield event.plain_result("权限不足：仅管理员可查看用户列表。")
                 return
-            users = await asyncio.to_thread(store.list_users, 50)
+            users = await self._db(store.list_users, 50)
             if not self._is_superadmin(event):
                 users = [u for u in users if not self._is_protected(u["user_id"])]
             lines = ["【用户列表（最近活动）】"]
@@ -1337,6 +1581,23 @@ class UserMemoryPlugin(Star):
                     f"- {u['user_id']}  事件{u.get('events', 0)} 冷层{u.get('chunks', 0)}"
                 )
             yield event.plain_result("\n".join(lines))
+            return
+        if arg in ("clear", "清除", "purge"):
+            if not self._is_admin(event):
+                yield event.plain_result("权限不足：仅管理员可清除用户记忆。")
+                return
+            if len(tokens) < 2:
+                yield event.plain_result("用法：/usermem 清除 <user_id>")
+                return
+            target = tokens[1].strip()
+            if self._is_protected(target) and not self._is_superadmin(event):
+                yield event.plain_result("权限不足：该用户在受保护名单，仅超管可清除。")
+                return
+            try:
+                await self._db(store.forget_user, target)
+                yield event.plain_result(f"已清除用户 {target} 的全部记忆。")
+            except Exception as e:
+                yield event.plain_result(f"清除失败（可能数据库损坏）：{e}")
             return
         if arg in ("protect", "保护"):
             if not self._is_superadmin(event):
@@ -1374,8 +1635,8 @@ class UserMemoryPlugin(Star):
             )
             return
 
-        st = await asyncio.to_thread(store.stats, user_id)
-        cached = await asyncio.to_thread(store.get_inject_text, user_id)
+        st = await self._db(store.stats, user_id)
+        cached = await self._db(store.get_inject_text, user_id)
         yield event.plain_result(
             f"【用户记忆 v{__version__}】\n"
             f"- 事件数：{st['events']}\n"
@@ -1505,9 +1766,9 @@ class UserMemoryPlugin(Star):
         q = (request.query.get("q") or "").strip()
         limit = request.query.get("limit", 100, type=int) or 100
         if not q:
-            users = await asyncio.to_thread(store.list_users, min(limit, 500))
+            users = await self._db(store.list_users, min(limit, 500))
         else:
-            users = await asyncio.to_thread(store.search_users, q, min(limit, 500))
+            users = await self._db(store.search_users, q, min(limit, 500))
         return json_response({"users": users})
 
     async def api_providers(self):
@@ -1546,6 +1807,24 @@ class UserMemoryPlugin(Star):
         self._save_config()
         return json_response({"ok": True})
 
+    async def api_export(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        data = await self._db(store.export_all)
+        return json_response(data)
+
+    async def api_import(self):
+        store = self._get_store()
+        if store is None:
+            return error_response("存储未就绪")
+        p = await request.json(default={}) or {}
+        data = p.get("data")
+        if not isinstance(data, dict):
+            return error_response("缺少 data")
+        n = await self._db(store.import_all, data)
+        return json_response({"ok": True, "imported": n})
+
     async def api_meta(self):
         return json_response({"plugin": PLUGIN_NAME, "version": __version__})
 
@@ -1554,7 +1833,7 @@ class UserMemoryPlugin(Star):
         if store is None:
             return error_response("存储未就绪")
         limit = request.query.get("limit", 200, type=int) or 200
-        users = await asyncio.to_thread(store.list_users, max(1, min(limit, 500)))
+        users = await self._db(store.list_users, max(1, min(limit, 500)))
         return json_response({"users": users})
 
     async def api_user(self):
@@ -1564,8 +1843,8 @@ class UserMemoryPlugin(Star):
         uid = request.query.get("user_id")
         if not uid:
             return error_response("缺少 user_id")
-        detail = await asyncio.to_thread(store.get_detail, uid)
-        events = await asyncio.to_thread(store.list_events, uid, 200, 0)
+        detail = await self._db(store.get_detail, uid)
+        events = await self._db(store.list_events, uid, 200, 0)
         return json_response({"user": detail, "events": events})
 
     async def api_forget(self):
@@ -1576,7 +1855,7 @@ class UserMemoryPlugin(Star):
         uid = str((payload or {}).get("user_id") or "").strip()
         if not uid:
             return error_response("缺少 user_id")
-        await asyncio.to_thread(store.forget_user, uid)
+        await self._db(store.forget_user, uid)
         return json_response({"ok": True})
 
     @staticmethod
@@ -1596,7 +1875,7 @@ class UserMemoryPlugin(Star):
         val = str(p.get("value") or "").strip()
         if not uid or not val:
             return error_response("缺少 user_id 或 value")
-        await asyncio.to_thread(store.ensure_user, uid)
+        await self._db(store.ensure_user, uid)
         fact = self._normalize_facts(
             [
                 {
@@ -1611,7 +1890,7 @@ class UserMemoryPlugin(Star):
         )
         if not fact:
             return error_response("事实不合法")
-        await asyncio.to_thread(store.add_fact, uid, fact[0])
+        await self._db(store.add_fact, uid, fact[0])
         return json_response({"ok": True})
 
     async def api_fact_update(self):
@@ -1633,7 +1912,7 @@ class UserMemoryPlugin(Star):
             patch["tags"] = self._split_tags(p.get("tags"))
         if "pinned" in p:
             patch["pinned"] = bool(p.get("pinned"))
-        n = await asyncio.to_thread(store.update_fact, uid, old_value, patch)
+        n = await self._db(store.update_fact, uid, old_value, patch)
         return json_response({"ok": bool(n), "changed": n})
 
     async def api_fact_delete(self):
@@ -1645,7 +1924,7 @@ class UserMemoryPlugin(Star):
         val = str(p.get("value") or "").strip()
         if not uid or not val:
             return error_response("缺少 user_id 或 value")
-        n = await asyncio.to_thread(store.delete_fact, uid, val)
+        n = await self._db(store.delete_fact, uid, val)
         return json_response({"ok": bool(n), "removed": n})
 
     async def api_inject_save(self):
@@ -1657,8 +1936,8 @@ class UserMemoryPlugin(Star):
         if not uid:
             return error_response("缺少 user_id")
         text = str(p.get("text") or "")
-        await asyncio.to_thread(store.ensure_user, uid)
-        await asyncio.to_thread(store.set_inject_text, uid, text)
+        await self._db(store.ensure_user, uid)
+        await self._db(store.set_inject_text, uid, text)
         return json_response({"ok": True})
 
     async def api_event_delete(self):
@@ -1670,7 +1949,7 @@ class UserMemoryPlugin(Star):
         eid = p.get("id")
         if not uid or eid is None:
             return error_response("缺少 user_id 或 id")
-        n = await asyncio.to_thread(store.delete_event, uid, eid)
+        n = await self._db(store.delete_event, uid, eid)
         return json_response({"ok": bool(n)})
 
     @filter.llm_tool(name="edit_memory")
@@ -1690,7 +1969,7 @@ class UserMemoryPlugin(Star):
         store = self._get_store()
         if store is None:
             return "存储未就绪。"
-        detail = await asyncio.to_thread(store.get_detail, target)
+        detail = await self._db(store.get_detail, target)
         facts = detail.get("facts") or []
         inject_text = detail.get("inject_text") or ""
         ops = await self._parse_memory_edit(instruction, facts, inject_text)
@@ -1773,8 +2052,8 @@ class UserMemoryPlugin(Star):
                 if isinstance(fid, int) and 0 <= fid < len(facts):
                     val = facts[fid].get("value")
                 if val:
-                    await asyncio.to_thread(store.delete_fact, user_id, val)
-                    await asyncio.to_thread(store.add_block, user_id, val)
+                    await self._db(store.delete_fact, user_id, val)
+                    await self._db(store.add_block, user_id, val)
                     lines.append(f"已删除事实：{val}")
             elif t == "update_fact":
                 old = None
@@ -1782,7 +2061,7 @@ class UserMemoryPlugin(Star):
                     old = facts[fid].get("value")
                 patch = {k: op[k] for k in ("key", "value", "importance") if k in op}
                 if old and patch:
-                    await asyncio.to_thread(store.update_fact, user_id, old, patch)
+                    await self._db(store.update_fact, user_id, old, patch)
                     lines.append(f"已修改事实：{old} → {patch.get('value', old)}")
             elif t == "add_fact":
                 v = str(op.get("value") or "").strip()
@@ -1800,28 +2079,30 @@ class UserMemoryPlugin(Star):
                         ]
                     )
                     if fact:
-                        await asyncio.to_thread(store.ensure_user, user_id)
-                        await asyncio.to_thread(store.add_fact, user_id, fact[0])
+                        await self._db(store.ensure_user, user_id)
+                        await self._db(store.add_fact, user_id, fact[0])
                         lines.append(f"已新增事实：{v}")
             elif t == "set_inject_text":
-                await asyncio.to_thread(store.ensure_user, user_id)
-                await asyncio.to_thread(
+                await self._db(store.ensure_user, user_id)
+                await self._db(
                     store.set_inject_text, user_id, str(op.get("text") or "")
                 )
                 lines.append("已替换语境文本")
         return "\n".join(lines) if lines else "（无可执行操作）"
 
     async def terminate(self):
+        self._closing = True
         for t in list(self._idle_tasks.values()):
             try:
                 t.cancel()
             except Exception:
                 pass
         self._idle_tasks.clear()
-        if self._store is not None:
-            try:
-                self._store.close()
-            except Exception:
-                pass
-            self._store = None
-        logger.info("[用户记忆] 已停用。")
+        # 不关闭共享连接（避免关闭与写并发导致损坏）；只做一次 checkpoint。
+        try:
+            st = self._store
+            if st is not None:
+                await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, st.checkpoint)
+        except Exception:
+            pass
+        logger.info("[用户记忆] 已停用（共享连接保留）。")

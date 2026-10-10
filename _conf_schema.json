@@ -182,5 +182,16 @@
     "type": "list",
     "default": [],
     "hint": "仅超管可查看这些用户的记忆；普通管理员查询会被拒绝，列表也不展示。"
+  },
+  "backup_on_start": {
+    "description": "启动时自动备份数据库",
+    "type": "bool",
+    "default": true,
+    "hint": "每天首次加载时用 VACUUM INTO 生成 memory-YYYYMMDD.db 备份。"
+  },
+  "backup_keep_days": {
+    "description": "备份保留份数",
+    "type": "int",
+    "default": 7
   }
 }
