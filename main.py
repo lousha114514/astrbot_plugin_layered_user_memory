@@ -94,7 +94,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -153,6 +153,8 @@ DEFAULTS = {
     # 启动时自动备份（VACUUM INTO）与保留天数
     "backup_on_start": True,
     "backup_keep_days": 7,
+    # 关闭记忆记录的群（群号列表；也可用 /usermem group 关闭）
+    "disabled_groups": [],
 }
 
 SCHEMA = """
@@ -212,6 +214,12 @@ CREATE TABLE IF NOT EXISTS blocklist(
   ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_block_user ON blocklist(user_id);
+
+CREATE TABLE IF NOT EXISTS privacy(
+  user_id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL DEFAULT 'all',
+  groups_off TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 FENCE_RE = re.compile(r"^```[a-zA-Z]*\n?|\n?```$")
@@ -345,6 +353,7 @@ class _Store:
                     "blocklist": rows(
                         "SELECT user_id,text,ts FROM blocklist WHERE user_id=?", (uid,)
                     ),
+                    "privacy": rows("SELECT * FROM privacy WHERE user_id=?", (uid,)),
                 }
             return {
                 "exported_at": int(time.time()),
@@ -354,6 +363,7 @@ class _Store:
                 "inject_cache": rows("SELECT * FROM inject_cache"),
                 "mem_chunks": rows("SELECT * FROM mem_chunks"),
                 "blocklist": rows("SELECT user_id,text,ts FROM blocklist"),
+                "privacy": rows("SELECT * FROM privacy"),
             }
 
     def events_by_ids(self, user_id, ids):
@@ -434,6 +444,12 @@ class _Store:
                 self.conn.execute(
                     "INSERT INTO blocklist(user_id,text,ts) VALUES(?,?,?)",
                     (r.get("user_id"), r.get("text", ""), _safe_int(r.get("ts"), 0)),
+                )
+                n += 1
+            for r in data.get("privacy", []) or []:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO privacy(user_id,mode,groups_off) VALUES(?,?,?)",
+                    (r.get("user_id"), r.get("mode", "all"), r.get("groups_off", "[]")),
                 )
                 n += 1
             self.conn.commit()
@@ -841,6 +857,30 @@ class _Store:
             ).fetchall()
             return [r["text"] for r in rows]
 
+    def get_privacy(self, user_id):
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT mode,groups_off FROM privacy WHERE user_id=?", (str(user_id),)
+            ).fetchone()
+        if not row:
+            return {"mode": "all", "groups_off": []}
+        try:
+            goff = json.loads(row["groups_off"] or "[]")
+        except Exception:
+            goff = []
+        if not isinstance(goff, list):
+            goff = []
+        return {"mode": row["mode"] or "all", "groups_off": [str(g) for g in goff]}
+
+    def set_privacy(self, user_id, mode, groups_off):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO privacy(user_id,mode,groups_off) VALUES(?,?,?)"
+                " ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode, groups_off=excluded.groups_off",
+                (str(user_id), str(mode), json.dumps([str(g) for g in (groups_off or [])])),
+            )
+            self.conn.commit()
+
     def stats(self, user_id):
         with self._lock:
             ev = self.conn.execute(
@@ -907,6 +947,7 @@ class UserMemoryPlugin(Star):
             except Exception:
                 pass
         self._closing = False
+        self._privacy_cache: dict = {}
         self._db_path: str | None = None
         self._db_dir: str | None = None
         self._last_backup_date: str | None = None
@@ -1136,6 +1177,9 @@ class UserMemoryPlugin(Star):
             scene = self._scene(event)
             addressed = self._addressed(event)
             mid = str(getattr(event.message_obj, "message_id", "") or "")
+            gid = event.get_group_id()
+            if gid and self._is_group_disabled(str(gid)):
+                return
             if is_bot:
                 # 机器人自己的发言：只作为“对话上下文”记录，不为它建档
                 await self._db(
@@ -1156,6 +1200,8 @@ class UserMemoryPlugin(Star):
                         await self._db(store.kv_set, "bot_name", nick)
                 except Exception:
                     pass
+                return
+            if not await self._allow_record(user_id, gid):
                 return
             await self._db(store.ensure_user, user_id)
             if nick:
@@ -1869,6 +1915,76 @@ class UserMemoryPlugin(Star):
             except Exception as e:
                 yield event.plain_result(f"清除失败（可能数据库损坏）：{e}")
             return
+        if arg in ("mode", "模式"):
+            if len(tokens) < 2:
+                yield event.plain_result(
+                    "用法：/usermem mode 全局|关闭本群|关闭|开启本群 [user_id]"
+                )
+                return
+            state = tokens[1].strip()
+            target = user_id
+            if len(tokens) >= 3:
+                target = tokens[2].strip()
+                if target != user_id:
+                    if not self._is_admin(event):
+                        yield event.plain_result("权限不足：仅管理员可设置他人。")
+                        return
+                    if self._is_protected(target) and not self._is_superadmin(event):
+                        yield event.plain_result("权限不足：该用户在受保护名单，仅超管可设置。")
+                        return
+            gid = event.get_group_id()
+            p = await self._get_privacy(target)
+            mode = p.get("mode", "all")
+            goff = list(p.get("groups_off") or [])
+            if state in ("全局", "all", "global"):
+                mode, goff = "all", []
+            elif state in ("关闭", "none", "off"):
+                mode, goff = "none", []
+            elif state in ("关闭本群", "off_group"):
+                if not gid:
+                    yield event.plain_result("该指令需在群聊中使用。")
+                    return
+                mode = "all"
+                if str(gid) not in goff:
+                    goff.append(str(gid))
+            elif state in ("开启本群", "on_group"):
+                if not gid:
+                    yield event.plain_result("该指令需在群聊中使用。")
+                    return
+                mode = "all"
+                goff = [g for g in goff if g != str(gid)]
+            else:
+                yield event.plain_result(
+                    "用法：/usermem mode 全局|关闭本群|关闭|开启本群 [user_id]"
+                )
+                return
+            await self._db(store.set_privacy, target, mode, goff)
+            self._privacy_cache.pop(target, None)
+            yield event.plain_result(
+                f"已更新 {target} 的记忆记录设置：{state}（mode={mode}，本群关闭={goff}）"
+            )
+            return
+        if arg in ("group", "群"):
+            if not self._is_superadmin(event):
+                yield event.plain_result("权限不足：仅超管可设置本群是否记录。")
+                return
+            gid = event.get_group_id()
+            if not gid:
+                yield event.plain_result("该指令需在群聊中使用。")
+                return
+            sub = tokens[1].strip().lower() if len(tokens) >= 2 else ""
+            ids = self._id_set(self.cfg("disabled_groups"))
+            if sub in ("off", "关闭", "关"):
+                ids.add(str(gid))
+                self._set_config_list("disabled_groups", ids)
+                yield event.plain_result(f"本群({gid})已关闭记忆记录。")
+            elif sub in ("on", "开启", "开"):
+                ids.discard(str(gid))
+                self._set_config_list("disabled_groups", ids)
+                yield event.plain_result(f"本群({gid})已开启记忆记录。")
+            else:
+                yield event.plain_result("用法：/usermem group 开启|关闭")
+            return
         if arg in ("rebuild", "重建", "重建库"):
             if not self._is_superadmin(event):
                 yield event.plain_result("权限不足：仅超管可重建数据库。")
@@ -1922,12 +2038,14 @@ class UserMemoryPlugin(Star):
 
         st = await self._db(store.stats, user_id)
         cached = await self._db(store.get_inject_text, user_id)
+        p = await self._get_privacy(user_id)
         yield event.plain_result(
             f"【用户记忆 v{__version__}】\n"
             f"- 事件数：{st['events']}\n"
             f"- 冷层块数：{st['chunks']}\n"
             f"- 语境文本：{'有' if cached else '无'}\n"
-            "指令：/usermem 查看（自己）、/usermem 整理、/usermem 删除、/usermem 模型；管理员：/usermem 列表、/usermem 查看 <user_id>"
+            f"- 记录设置：{p.get('mode')}（本群关闭={p.get('groups_off') or []}）\n"
+            "指令：/usermem 查看、整理、删除、模型、mode、group；管理员：列表、查看 <id>、清除 <id>"
         )
 
     def _list_models(self) -> str:
@@ -1999,6 +2117,32 @@ class UserMemoryPlugin(Star):
         if not self._is_admin(event):
             return False
         return not self._is_protected(target_id)
+
+    def _is_group_disabled(self, gid) -> bool:
+        return str(gid) in self._id_set(self.cfg("disabled_groups"))
+
+    async def _get_privacy(self, uid):
+        now = time.time()
+        c = self._privacy_cache.get(uid)
+        if c and now - c[0] < 30:
+            return c[1]
+        store = self._get_store()
+        if store is None:
+            return {"mode": "all", "groups_off": []}
+        try:
+            p = await self._db(store.get_privacy, uid)
+        except Exception:
+            p = {"mode": "all", "groups_off": []}
+        self._privacy_cache[uid] = (now, p)
+        return p
+
+    async def _allow_record(self, user_id, gid) -> bool:
+        p = await self._get_privacy(user_id)
+        if p.get("mode") == "none":
+            return False
+        if gid and str(gid) in set(p.get("groups_off") or []):
+            return False
+        return True
 
     def _set_config_list(self, key, values):
         vals = sorted({str(v).strip() for v in values if str(v).strip()})

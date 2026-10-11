@@ -199,5 +199,11 @@
     "description": "备份保留份数",
     "type": "int",
     "default": 7
+  },
+  "disabled_groups": {
+    "description": "关闭记忆记录的群（群号列表）",
+    "type": "list",
+    "default": [],
+    "hint": "列表中的群不会被记录任何记忆；也可在群内用 /usermem group 关闭 切换。"
   }
 }
