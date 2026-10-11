@@ -94,7 +94,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -1201,7 +1201,7 @@ class UserMemoryPlugin(Star):
                 except Exception:
                     pass
                 return
-            if not await self._allow_record(user_id, gid):
+            if not await self._allow_record(user_id, scene):
                 return
             await self._db(store.ensure_user, user_id)
             if nick:
@@ -1916,10 +1916,12 @@ class UserMemoryPlugin(Star):
                 yield event.plain_result(f"清除失败（可能数据库损坏）：{e}")
             return
         if arg in ("mode", "模式"):
+            usage = (
+                "用法：/usermem mode 全局|关闭当前会话|开启当前会话|关闭 [user_id]\n"
+                "（当前会话指你发这条命令所在的私聊或群聊；不带 user_id 即设自己）"
+            )
             if len(tokens) < 2:
-                yield event.plain_result(
-                    "用法：/usermem mode 全局|关闭本群|关闭|开启本群 [user_id]"
-                )
+                yield event.plain_result(usage)
                 return
             state = tokens[1].strip()
             target = user_id
@@ -1932,7 +1934,7 @@ class UserMemoryPlugin(Star):
                     if self._is_protected(target) and not self._is_superadmin(event):
                         yield event.plain_result("权限不足：该用户在受保护名单，仅超管可设置。")
                         return
-            gid = event.get_group_id()
+            scene = self._scene(event)
             p = await self._get_privacy(target)
             mode = p.get("mode", "all")
             goff = list(p.get("groups_off") or [])
@@ -1940,28 +1942,21 @@ class UserMemoryPlugin(Star):
                 mode, goff = "all", []
             elif state in ("关闭", "none", "off"):
                 mode, goff = "none", []
-            elif state in ("关闭本群", "off_group"):
-                if not gid:
-                    yield event.plain_result("该指令需在群聊中使用。")
-                    return
+            elif state in ("关闭当前会话", "关闭本群", "off_session", "off_group"):
                 mode = "all"
-                if str(gid) not in goff:
-                    goff.append(str(gid))
-            elif state in ("开启本群", "on_group"):
-                if not gid:
-                    yield event.plain_result("该指令需在群聊中使用。")
-                    return
+                if scene not in goff:
+                    goff.append(scene)
+            elif state in ("开启当前会话", "开启本群", "on_session", "on_group"):
                 mode = "all"
-                goff = [g for g in goff if g != str(gid)]
+                goff = [g for g in goff if g != scene]
             else:
-                yield event.plain_result(
-                    "用法：/usermem mode 全局|关闭本群|关闭|开启本群 [user_id]"
-                )
+                yield event.plain_result(usage)
                 return
             await self._db(store.set_privacy, target, mode, goff)
             self._privacy_cache.pop(target, None)
             yield event.plain_result(
-                f"已更新 {target} 的记忆记录设置：{state}（mode={mode}，本群关闭={goff}）"
+                f"已更新 {target} 的记忆记录设置：{state}\n"
+                f"（mode={mode}，关闭的会话={goff}，当前会话={scene}）"
             )
             return
         if arg in ("group", "群"):
@@ -2044,7 +2039,7 @@ class UserMemoryPlugin(Star):
             f"- 事件数：{st['events']}\n"
             f"- 冷层块数：{st['chunks']}\n"
             f"- 语境文本：{'有' if cached else '无'}\n"
-            f"- 记录设置：{p.get('mode')}（本群关闭={p.get('groups_off') or []}）\n"
+            f"- 记录设置：{p.get('mode')}（关闭的会话={p.get('groups_off') or []}）\n"
             "指令：/usermem 查看、整理、删除、模型、mode、group；管理员：列表、查看 <id>、清除 <id>"
         )
 
@@ -2136,12 +2131,17 @@ class UserMemoryPlugin(Star):
         self._privacy_cache[uid] = (now, p)
         return p
 
-    async def _allow_record(self, user_id, gid) -> bool:
+    async def _allow_record(self, user_id, scene) -> bool:
         p = await self._get_privacy(user_id)
         if p.get("mode") == "none":
             return False
-        if gid and str(gid) in set(p.get("groups_off") or []):
+        off = set(p.get("groups_off") or [])
+        if scene in off:
             return False
+        if str(scene).startswith("group:"):
+            gid = str(scene).split(":", 1)[1]
+            if gid in off:  # 兼容旧数据（只存群号）
+                return False
         return True
 
     def _set_config_list(self, key, values):
