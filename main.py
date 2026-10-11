@@ -94,7 +94,7 @@ except Exception:  # pragma: no cover
         pass
 
 PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.8.1"
+__version__ = "1.8.2"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
