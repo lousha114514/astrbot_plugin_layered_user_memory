@@ -18,7 +18,7 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-PLUGIN_NAME = "astrbot_plugin_user_memory"
+PLUGIN_NAME = "astrbot_plugin_layered_user_memory"
 
 # 打进 zip 的文件（平铺在压缩包根目录，符合 AstrBot 上传格式）
 INCLUDE = [

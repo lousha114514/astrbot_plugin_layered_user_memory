@@ -93,8 +93,10 @@ except Exception:  # pragma: no cover
     except Exception:
         pass
 
-PLUGIN_NAME = "astrbot_plugin_user_memory"
-__version__ = "1.8.2"
+PLUGIN_NAME = "astrbot_plugin_layered_user_memory"
+# 数据目录名固定不变（不随插件改名而变），避免历史记忆丢失
+DATA_DIR_NAME = "astrbot_plugin_user_memory"
+__version__ = "1.9.0"
 
 # 所有数据库操作串行到单一线程，且全局共享一把可重入锁（跨实例也串行）
 _DB_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -1027,7 +1029,7 @@ class UserMemoryPlugin(Star):
                 if get_astrbot_plugin_data_path
                 else os.path.join(os.getcwd(), "data", "plugin_data")
             )
-            self._db_dir = os.path.join(base, PLUGIN_NAME)
+            self._db_dir = os.path.join(base, DATA_DIR_NAME)
             self._db_path = os.path.join(self._db_dir, "memory.db")
             self._store = _open_store_safe(self._db_path)
             if not self._store.integrity_ok():

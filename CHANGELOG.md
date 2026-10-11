@@ -6,6 +6,11 @@
 - MINOR：向后兼容的新功能。
 - PATCH：向后兼容的修复。
 
+## v1.9.0
+
+- 改名：插件名由 `astrbot_plugin_user_memory` 改为 `astrbot_plugin_layered_user_memory`（避免与已有同名插件冲突）；仓库地址同步更新。
+- 兼容：**数据目录名固定不变**（仍为 `astrbot_plugin_user_memory`），改名后历史记忆不丢。
+
 ## v1.8.2
 
 - 维护：`metadata.yaml` 的 `repo` 修正为插件自身仓库地址（此前误填为上一个插件的仓库）。
